@@ -1,629 +1,1330 @@
+import dns from 'node:dns/promises';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
-import { NextResponse } from 'next/server';
-import { getDb, getSafeDatabaseStatus, testDatabaseConnection } from '@/db/adapter';
-import { getMigrationHistory, runMigrations } from '@/db/migrator';
+import zlib from 'node:zlib';
+import * as cheerio from 'cheerio';
 import {
-  AuthError,
-  attachSessionCookies,
-  checkRateLimit,
-  createUserSession,
-  getClientIp,
-  getSessionUser,
-  guardWriteFreeze,
-  requireAuth,
-  requireStoreAccess,
-  requireSuperAdmin,
-  revokeCurrentSession,
-  verifyCsrf,
-  writeAuditLog,
-} from '@/lib/auth';
-import {
-  analyzeWebsiteSafely,
-  answerGroundedQuestion,
-  createEncryptedDatabaseBackup,
-  createOrderWithPayment,
-  createOrUpdateProduct,
-  createStoreWithDefaults,
-  executeZeroDataLossDbSwitch,
-  getStorePlanLimits,
-  initiateOfficialBkashPayment,
-  listBackups,
-  restoreEncryptedBackup,
-  verifyManualPayment,
-} from '@/lib/platform-services';
-import { generateToken, generateUuid, hashPassword, verifyPassword } from '@/lib/security/crypto';
-import {
-  aiAnalyzeSchema,
-  aiChatSchema,
-  builderBlockSchema,
-  categorySchema,
-  checkoutSchema,
-  couponSchema,
-  createStoreSchema,
-  dbConfigSchema,
-  dbSwitchRequestSchema,
-  domainAddSchema,
-  loginSchema,
-  oneClickShopSchema,
-  productSchema,
-  registerSchema,
-  storeThemeSchema,
-  toSlug,
-} from '@/lib/validation/schemas';
-import { z } from 'zod';
+  createAdapterFromConfig,
+  getActiveDatabaseConfig,
+  getDb,
+  reloadActiveDatabasePool,
+  saveActiveDatabaseConfig,
+  setWriteFrozen,
+  testDatabaseConnection,
+} from '@/db/adapter';
+import { runMigrations } from '@/db/migrator';
+import { writeAuditLog } from '@/lib/auth';
+import { decryptSecret, encryptSecret, generateToken, generateUuid, sha256Hex } from '@/lib/security/crypto';
+import { isReservedSlug, sanitizeRichText, toSlug } from '@/lib/validation/schemas';
+import type {
+  BackupMetadata,
+  BuilderBlock,
+  DatabaseConnectionConfig,
+  MigrationStepReport,
+  PlanLimits,
+  StoreThemeConfig,
+  VerifiedWebsiteAnalysis,
+} from '@/types/platform';
 
-type RouteContext = { params: Promise<{ path: string[] }> };
+const DEFAULT_THEME: StoreThemeConfig = {
+  primaryColor: '#4f46e5',
+  secondaryColor: '#0f172a',
+  backgroundColor: '#ffffff',
+  textColor: '#0f172a',
+  fontFamily: 'noto-bengali',
+  headerStyle: 'classic',
+  footerText: 'Powered by BongoCommerce SaaS',
+  showSearch: true,
+  showCategories: true,
+};
 
-function handleError(err: unknown) {
-  if (err instanceof AuthError) {
-    return NextResponse.json({ error: err.message }, { status: err.status });
-  }
-  if (err instanceof z.ZodError) {
-    return NextResponse.json({ error: 'Validation failed', details: err.flatten() }, { status: 400 });
-  }
-  const message = err instanceof Error ? err.message : 'Internal server error';
-  return NextResponse.json({ error: message }, { status: 400 });
+function defaultHomepageBlocks(storeName: string, tagline?: string): BuilderBlock[] {
+  return [
+    {
+      id: 'hero-1',
+      type: 'hero',
+      enabled: true,
+      title: `স্বাগতম ${storeName}-এ`,
+      subtitle: tagline || 'আপনার বিশ্বস্ত অনলাইন শপ — সেরা মানের পণ্য এখন এক ক্লিকেই।',
+      ctaText: 'পণ্য দেখুন',
+      ctaUrl: '#products',
+    },
+    {
+      id: 'products-1',
+      type: 'product_grid',
+      enabled: true,
+      title: 'আমাদের জনপ্রিয় পণ্যসমূহ',
+      columns: 4,
+      limit: 12,
+    },
+    {
+      id: 'contact-1',
+      type: 'contact_info',
+      enabled: true,
+      title: 'যোগাযোগ করুন',
+      subtitle: 'যেকোনো তথ্যের জন্য আমাদের সাথে যোগাযোগ করুন।',
+    },
+  ];
 }
 
-export async function GET(req: Request, context: RouteContext) {
-  try {
-    const { path: segs } = await context.params;
-    const route = segs.join('/');
-    const url = new URL(req.url);
-    const db = getDb();
+function boolVal(val: boolean): boolean | number {
+  return getDb().engine === 'postgresql' ? val : val ? 1 : 0;
+}
 
-    if (route === 'health') {
-      const dbStatus = await getSafeDatabaseStatus();
-      return NextResponse.json({ ok: dbStatus.connected, dbStatus });
+export async function generateUniqueStoreSlug(baseName: string): Promise<string> {
+  const db = getDb();
+  let base = toSlug(baseName);
+  if (isReservedSlug(base)) base = `${base}-shop`;
+
+  let candidate = base;
+  let counter = 1;
+  while (true) {
+    const existing = await db.query<{ id: string }>('SELECT id FROM stores WHERE slug = ? LIMIT 1', [
+      candidate,
+    ]);
+    if (existing.rows.length === 0 && !isReservedSlug(candidate)) {
+      return candidate;
     }
-
-    if (route === 'auth/me') {
-      const user = await getSessionUser();
-      return NextResponse.json({ user });
-    }
-
-    if (route === 'stores/public') {
-      const slug = url.searchParams.get('slug');
-      const productSlug = url.searchParams.get('productSlug');
-      if (slug) {
-        const sRes = await db.query(
-          `SELECT id, name, slug, tagline, description, logo_url, banner_url, currency, contact_email, contact_phone, theme_config, homepage_blocks, status, is_published
-           FROM stores WHERE slug = ? AND status = 'ACTIVE' LIMIT 1`,
-          [slug]
-        );
-        const store = sRes.rows[0] as Record<string, unknown> | undefined;
-        if (!store) return NextResponse.json({ error: 'Store not found' }, { status: 404 });
-
-        const [productsRes, catsRes] = await Promise.all([
-          db.query(
-            `SELECT id, name, slug, global_alias, description, price, compare_at_price, stock, is_digital, images_json, seo_title, seo_description
-             FROM products WHERE store_id = ? AND is_active = ? ORDER BY created_at DESC`,
-            [store.id, db.engine === 'postgresql' ? true : 1]
-          ),
-          db.query('SELECT id, name, slug FROM categories WHERE store_id = ? ORDER BY sort_order ASC', [
-            store.id,
-          ]),
-        ]);
-
-        let selectedProduct = null;
-        if (productSlug) {
-          selectedProduct =
-            (productsRes.rows as Array<{ slug: string }>).find((p) => p.slug === productSlug) || null;
-        }
-
-        return NextResponse.json({
-          store,
-          products: productsRes.rows,
-          categories: catsRes.rows,
-          selectedProduct,
-        });
-      }
-
-      const listRes = await db.query(
-        `SELECT id, name, slug, tagline, logo_url FROM stores WHERE status = 'ACTIVE' AND is_published = ? ORDER BY created_at DESC LIMIT 30`,
-        [db.engine === 'postgresql' ? true : 1]
-      );
-      return NextResponse.json({ stores: listRes.rows });
-    }
-
-    if (route === 'orders/track') {
-      const orderNumber = url.searchParams.get('orderNumber')?.trim();
-      const email = url.searchParams.get('email')?.trim().toLowerCase();
-      if (!orderNumber || !email) {
-        return NextResponse.json({ error: 'orderNumber and email are required' }, { status: 400 });
-      }
-      const oRes = await db.query(
-        'SELECT id, order_number, status, payment_status, total_amount, currency, created_at FROM orders WHERE order_number = ? AND customer_email = ? LIMIT 1',
-        [orderNumber, email]
-      );
-      if (!oRes.rows[0]) return NextResponse.json({ error: 'Order not found' }, { status: 404 });
-      return NextResponse.json({ order: oRes.rows[0] });
-    }
-
-    if (route === 'my/stores') {
-      const user = await requireAuth();
-      const [storesRes, plansRes, invoicesRes] = await Promise.all([
-        db.query(
-          `SELECT s.*, sm.role AS member_role
-           FROM stores s JOIN store_members sm ON sm.store_id = s.id
-           WHERE sm.user_id = ? ORDER BY s.created_at DESC`,
-          [user.id]
-        ),
-        db.query('SELECT id, code, name, price_monthly, price_yearly, limits_json FROM subscription_plans ORDER BY price_monthly ASC'),
-        db.query(
-          `SELECT si.* FROM subscription_invoices si
-           JOIN store_members sm ON sm.store_id = si.store_id
-           WHERE sm.user_id = ? ORDER BY si.created_at DESC LIMIT 30`,
-          [user.id]
-        ),
-      ]);
-      return NextResponse.json({ stores: storesRes.rows, plans: plansRes.rows, invoices: invoicesRes.rows });
-    }
-
-    // Store-scoped management overview: stores/:storeId/manage
-    if (segs[0] === 'stores' && segs[2] === 'manage' && segs[1]) {
-      const user = await requireAuth();
-      const storeId = segs[1];
-      await requireStoreAccess(user, storeId);
-
-      const [storeRes, productsRes, categoriesRes, couponsRes, ordersRes, paymentsRes, domainsRes, staffRes, customersRes] =
-        await Promise.all([
-          db.query('SELECT * FROM stores WHERE id = ? LIMIT 1', [storeId]),
-          db.query('SELECT * FROM products WHERE store_id = ? ORDER BY created_at DESC', [storeId]),
-          db.query('SELECT * FROM categories WHERE store_id = ? ORDER BY sort_order ASC', [storeId]),
-          db.query('SELECT * FROM coupons WHERE store_id = ? ORDER BY created_at DESC', [storeId]),
-          db.query('SELECT * FROM orders WHERE store_id = ? ORDER BY created_at DESC LIMIT 100', [storeId]),
-          db.query('SELECT * FROM payments WHERE store_id = ? ORDER BY created_at DESC LIMIT 100', [storeId]),
-          db.query('SELECT * FROM domains WHERE store_id = ? ORDER BY created_at DESC', [storeId]),
-          db.query(
-            'SELECT sm.id, sm.role, u.name, u.email FROM store_members sm JOIN users u ON u.id = sm.user_id WHERE sm.store_id = ?',
-            [storeId]
-          ),
-          db.query('SELECT * FROM customers WHERE store_id = ? ORDER BY created_at DESC LIMIT 100', [storeId]),
-        ]);
-
-      return NextResponse.json({
-        store: storeRes.rows[0],
-        products: productsRes.rows,
-        categories: categoriesRes.rows,
-        coupons: couponsRes.rows,
-        orders: ordersRes.rows,
-        payments: paymentsRes.rows,
-        domains: domainsRes.rows,
-        staff: staffRes.rows,
-        customers: customersRes.rows,
-      });
-    }
-
-    if (route === 'super-admin/overview') {
-      await requireSuperAdmin();
-      const [
-        storesRes,
-        usersRes,
-        domainsRes,
-        ordersRes,
-        paymentsRes,
-        plansRes,
-        auditRes,
-        dbStatus,
-        migrations,
-      ] = await Promise.all([
-        db.query('SELECT s.*, u.email AS owner_email FROM stores s JOIN users u ON u.id = s.owner_id ORDER BY s.created_at DESC LIMIT 100'),
-        db.query('SELECT id, name, email, phone, platform_role, is_active, created_at FROM users ORDER BY created_at DESC LIMIT 100'),
-        db.query('SELECT d.*, s.name AS store_name FROM domains d JOIN stores s ON s.id = d.store_id ORDER BY d.created_at DESC LIMIT 100'),
-        db.query('SELECT o.*, s.name AS store_name FROM orders o JOIN stores s ON s.id = o.store_id ORDER BY o.created_at DESC LIMIT 100'),
-        db.query('SELECT * FROM payments ORDER BY created_at DESC LIMIT 100'),
-        db.query('SELECT * FROM subscription_plans ORDER BY price_monthly ASC'),
-        db.query('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 80'),
-        getSafeDatabaseStatus(),
-        getMigrationHistory().catch(() => []),
-      ]);
-
-      return NextResponse.json({
-        stores: storesRes.rows,
-        users: usersRes.rows,
-        domains: domainsRes.rows,
-        orders: ordersRes.rows,
-        payments: paymentsRes.rows,
-        plans: plansRes.rows,
-        auditLogs: auditRes.rows,
-        dbStatus,
-        migrations,
-        backups: listBackups(),
-        phpMyAdminUrl: process.env.PHPMYADMIN_EXTERNAL_URL || null,
-      });
-    }
-
-    if (segs[0] === 'super-admin' && segs[1] === 'backups' && segs[2]) {
-      await requireSuperAdmin();
-      const safeName = path.basename(segs[2]);
-      const fullPath = path.resolve(process.cwd(), process.env.LOCAL_STORAGE_PATH || './storage', 'backups', safeName);
-      if (!fs.existsSync(fullPath)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-      const data = fs.readFileSync(fullPath);
-      return new NextResponse(data, {
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Disposition': `attachment; filename="${safeName}"`,
-        },
-      });
-    }
-
-    return NextResponse.json({ error: 'Endpoint not found' }, { status: 404 });
-  } catch (err) {
-    return handleError(err);
+    counter += 1;
+    candidate = `${base}-${counter}`;
   }
 }
 
-async function handleMutation(req: Request, context: RouteContext) {
-  try {
-    const { path: segs } = await context.params;
-    const route = segs.join('/');
-    const ip = await getClientIp();
-    const db = getDb();
-
-    if (!(await verifyCsrf(req))) {
-      return NextResponse.json({ error: 'Invalid CSRF token' }, { status: 403 });
+export async function generateUniqueGlobalAlias(baseName: string): Promise<string> {
+  const db = getDb();
+  let base = toSlug(baseName);
+  if (isReservedSlug(base)) base = `item-${base}`;
+  let candidate = base;
+  let counter = 1;
+  while (true) {
+    const [p, s] = await Promise.all([
+      db.query<{ id: string }>('SELECT id FROM products WHERE global_alias = ? LIMIT 1', [candidate]),
+      db.query<{ id: string }>('SELECT id FROM stores WHERE slug = ? LIMIT 1', [candidate]),
+    ]);
+    if (p.rows.length === 0 && s.rows.length === 0 && !isReservedSlug(candidate)) {
+      return candidate;
     }
+    counter += 1;
+    candidate = `${base}-${counter}`;
+  }
+}
 
-    const currentUser = await getSessionUser();
-    const freezeResp = guardWriteFreeze(currentUser);
-    if (freezeResp && !route.startsWith('auth/')) return freezeResp;
+export async function getStorePlanLimits(storeId: string): Promise<PlanLimits> {
+  const db = getDb();
+  const res = await db.query<{ limits_json: string; status: string }>(
+    `SELECT sp.limits_json, ss.status
+     FROM store_subscriptions ss
+     JOIN subscription_plans sp ON sp.id = ss.plan_id
+     WHERE ss.store_id = ?
+     ORDER BY ss.created_at DESC LIMIT 1`,
+    [storeId]
+  );
+  if (res.rows[0]) {
+    return JSON.parse(res.rows[0].limits_json) as PlanLimits;
+  }
+  return {
+    maxProducts: 15,
+    maxOrdersPerMonth: 50,
+    maxStaff: 1,
+    maxStorageMb: 100,
+    maxCustomDomains: 0,
+    allowAiAssistant: true,
+    allowOfficialBkash: false,
+  };
+}
 
-    const body = await req.json().catch(() => ({}));
+export async function createStoreWithDefaults(params: {
+  ownerId: string;
+  name: string;
+  slug?: string;
+  tagline?: string;
+  description?: string;
+  contactEmail?: string;
+  contactPhone?: string;
+  isPublished?: boolean;
+  approvedByAdmin?: boolean;
+}): Promise<{ storeId: string; slug: string; storeUrl: string; adminUrl: string }> {
+  const db = getDb();
+  const storeId = generateUuid();
+  const slug = params.slug
+    ? await generateUniqueStoreSlug(params.slug)
+    : await generateUniqueStoreSlug(params.name);
+  const autoApprove =
+    params.approvedByAdmin || String(process.env.SELF_SERVICE_AUTO_APPROVE || 'true') === 'true';
+  const status = autoApprove ? 'ACTIVE' : 'PENDING';
+  const isPublished = params.isPublished ?? true;
 
-    // AUTH
-    if (route === 'auth/register') {
-      if (!checkRateLimit(`reg:${ip}`, 10, 60_000)) return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
-      const data = registerSchema.parse(body);
-      const exists = await db.query('SELECT id FROM users WHERE email = ? LIMIT 1', [data.email]);
-      if (exists.rows.length > 0) return NextResponse.json({ error: 'Email already registered' }, { status: 409 });
-
-      const userId = generateUuid();
-      await db.execute(
-        `INSERT INTO users (id, name, email, phone, password_hash, platform_role, is_active) VALUES (?, ?, ?, ?, ?, 'STORE_OWNER', ?)`,
-        [userId, data.name, data.email, data.phone || null, hashPassword(data.password), db.engine === 'postgresql' ? true : 1]
-      );
-
-      const sess = await createUserSession(userId);
-      const res = NextResponse.json({ user: { id: userId, name: data.name, email: data.email, platform_role: 'STORE_OWNER' } }, { status: 201 });
-      attachSessionCookies(res, sess.rawCookieValue, sess.csrfToken, sess.expiresAt);
-      return res;
-    }
-
-    if (route === 'auth/login') {
-      if (!checkRateLimit(`login:${ip}`, 15, 60_000)) return NextResponse.json({ error: 'Too many login attempts' }, { status: 429 });
-      const data = loginSchema.parse(body);
-      const resUser = await db.query<{ id: string; name: string; email: string; password_hash: string; platform_role: string; is_active: boolean | number }>(
-        'SELECT id, name, email, password_hash, platform_role, is_active FROM users WHERE email = ? LIMIT 1',
-        [data.email]
-      );
-      const u = resUser.rows[0];
-      if (!u || !u.is_active || !verifyPassword(data.password, u.password_hash)) {
-        await writeAuditLog({ action: 'LOGIN_FAILED', targetType: 'user', metadata: { email: data.email } });
-        return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
-      }
-      const sess = await createUserSession(u.id);
-      const res = NextResponse.json({ user: { id: u.id, name: u.name, email: u.email, platform_role: u.platform_role } });
-      attachSessionCookies(res, sess.rawCookieValue, sess.csrfToken, sess.expiresAt);
-      return res;
-    }
-
-    if (route === 'auth/logout') {
-      await revokeCurrentSession();
-      const res = NextResponse.json({ ok: true });
-      res.cookies.delete('bongo_session');
-      return res;
-    }
-
-    // ONE-CLICK SHOP CREATION
-    if (route === 'stores/one-click') {
-      const user = await requireAuth();
-      const data = oneClickShopSchema.parse(body);
-      const shopName = data.preferredStoreName || `${data.ownerName} Store`;
-      const created = await createStoreWithDefaults({
-        ownerId: user.id,
-        name: shopName,
-        tagline: data.tagline,
-        contactEmail: user.email,
-        isPublished: data.publishImmediately,
-      });
-      return NextResponse.json(created, { status: 201 });
-    }
-
-    if (route === 'stores') {
-      const user = await requireAuth();
-      const data = createStoreSchema.parse(body);
-      const targetOwner = user.platform_role === 'SUPER_ADMIN' && body.ownerId ? String(body.ownerId) : user.id;
-      const created = await createStoreWithDefaults({
-        ownerId: targetOwner,
-        name: data.name,
-        slug: data.slug,
-        tagline: data.tagline,
-        description: data.description,
-        contactEmail: data.contactEmail || user.email,
-        contactPhone: data.contactPhone,
-        approvedByAdmin: user.platform_role === 'SUPER_ADMIN',
-      });
-      return NextResponse.json(created, { status: 201 });
-    }
-
-    // STORE BUILDER / CUSTOMIZATION
-    if (segs[0] === 'stores' && segs[2] === 'builder' && segs[1]) {
-      const user = await requireAuth();
-      const storeId = segs[1];
-      await requireStoreAccess(user, storeId, ['OWNER', 'MANAGER', 'EDITOR']);
-
-      const theme = body.theme ? storeThemeSchema.parse(body.theme) : null;
-      const blocks = body.blocks ? z.array(builderBlockSchema).max(20).parse(body.blocks) : null;
-      const updates: string[] = [];
-      const params: unknown[] = [];
-
-      if (body.name) { updates.push('name = ?'); params.push(String(body.name).slice(0, 160)); }
-      if (body.tagline !== undefined) { updates.push('tagline = ?'); params.push(String(body.tagline).slice(0, 255)); }
-      if (body.logoUrl !== undefined) { updates.push('logo_url = ?'); params.push(String(body.logoUrl).slice(0, 500)); }
-      if (body.bannerUrl !== undefined) { updates.push('banner_url = ?'); params.push(String(body.bannerUrl).slice(0, 500)); }
-      if (body.isPublished !== undefined) {
-        updates.push('is_published = ?');
-        params.push(db.engine === 'postgresql' ? Boolean(body.isPublished) : body.isPublished ? 1 : 0);
-      }
-      if (theme) { updates.push('theme_config = ?'); params.push(JSON.stringify(theme)); }
-      if (blocks) { updates.push('homepage_blocks = ?'); params.push(JSON.stringify(blocks)); }
-
-      if (updates.length > 0) {
-        updates.push('updated_at = ?');
-        params.push(new Date(), storeId);
-        await db.execute(`UPDATE stores SET ${updates.join(', ')} WHERE id = ?`, params);
-      }
-      return NextResponse.json({ ok: true });
-    }
-
-    // PRODUCTS / CATEGORIES / COUPONS / DOMAINS / ORDERS
-    if (segs[0] === 'stores' && segs[2] === 'products' && segs[1]) {
-      const user = await requireAuth();
-      const storeId = segs[1];
-      await requireStoreAccess(user, storeId, ['OWNER', 'MANAGER', 'EDITOR']);
-
-      if (req.method === 'DELETE' && segs[3]) {
-        await db.execute('DELETE FROM products WHERE id = ? AND store_id = ?', [segs[3], storeId]);
-        return NextResponse.json({ ok: true });
-      }
-      const data = productSchema.parse(body);
-      const saved = await createOrUpdateProduct({
+  await db.transaction(async (tx) => {
+    await tx.execute(
+      `INSERT INTO stores (id, owner_id, name, slug, tagline, description, status, is_published, currency, contact_email, contact_phone, theme_config, homepage_blocks)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'BDT', ?, ?, ?, ?)`,
+      [
         storeId,
-        productId: body.id ? String(body.id) : undefined,
-        ...data,
-      });
-      return NextResponse.json(saved, { status: 201 });
-    }
-
-    if (segs[0] === 'stores' && segs[2] === 'categories' && segs[1]) {
-      const user = await requireAuth();
-      const storeId = segs[1];
-      await requireStoreAccess(user, storeId, ['OWNER', 'MANAGER', 'EDITOR']);
-      const data = categorySchema.parse(body);
-      const id = generateUuid();
-      await db.execute(
-        'INSERT INTO categories (id, store_id, name, slug, description, sort_order, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [id, storeId, data.name, data.slug || toSlug(data.name), data.description || null, data.sortOrder, db.engine === 'postgresql' ? data.isActive : data.isActive ? 1 : 0]
-      );
-      return NextResponse.json({ id }, { status: 201 });
-    }
-
-    if (segs[0] === 'stores' && segs[2] === 'coupons' && segs[1]) {
-      const user = await requireAuth();
-      const storeId = segs[1];
-      await requireStoreAccess(user, storeId, ['OWNER', 'MANAGER']);
-      const data = couponSchema.parse(body);
-      const id = generateUuid();
-      await db.execute(
-        'INSERT INTO coupons (id, store_id, code, discount_type, discount_value, min_order_amount, max_uses, expires_at, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [id, storeId, data.code, data.discountType, data.discountValue.toFixed(2), data.minOrderAmount.toFixed(2), data.maxUses || null, data.expiresAt ? new Date(data.expiresAt) : null, db.engine === 'postgresql' ? data.isActive : data.isActive ? 1 : 0]
-      );
-      return NextResponse.json({ id }, { status: 201 });
-    }
-
-    if (segs[0] === 'stores' && segs[2] === 'domains' && segs[1]) {
-      const user = await requireAuth();
-      const storeId = segs[1];
-      await requireStoreAccess(user, storeId, ['OWNER', 'MANAGER']);
-      const data = domainAddSchema.parse({ ...body, storeId });
-      const limits = await getStorePlanLimits(storeId);
-      const cnt = await db.query<{ c: string | number }>('SELECT COUNT(*) AS c FROM domains WHERE store_id = ?', [storeId]);
-      if (Number(cnt.rows[0]?.c || 0) >= limits.maxCustomDomains && user.platform_role !== 'SUPER_ADMIN') {
-        return NextResponse.json({ error: `Custom domain limit (${limits.maxCustomDomains}) reached for your plan.` }, { status: 403 });
-      }
-      const id = generateUuid();
-      const token = `bongo-verify=${generateToken(16)}`;
-      await db.execute(
-        'INSERT INTO domains (id, store_id, hostname, is_primary, status, verification_token) VALUES (?, ?, ?, ?, ?, ?)',
-        [id, storeId, data.hostname, db.engine === 'postgresql' ? data.isPrimary : data.isPrimary ? 1 : 0, 'PENDING_DNS', token]
-      );
-      return NextResponse.json({ id, hostname: data.hostname, verificationToken: token }, { status: 201 });
-    }
-
-    if (segs[0] === 'stores' && segs[2] === 'orders' && segs[3]) {
-      const user = await requireAuth();
-      const storeId = segs[1];
-      await requireStoreAccess(user, storeId, ['OWNER', 'MANAGER']);
-      const allowed = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'REFUNDED'];
-      if (!allowed.includes(body.status)) return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
-      await db.execute('UPDATE orders SET status = ?, updated_at = ? WHERE id = ? AND store_id = ?', [
-        body.status,
-        new Date(),
-        segs[3],
-        storeId,
-      ]);
-      return NextResponse.json({ ok: true });
-    }
-
-    // CHECKOUT (PUBLIC STOREFRONT)
-    if (route === 'checkout') {
-      if (!checkRateLimit(`checkout:${ip}`, 20, 60_000)) return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
-      const data = checkoutSchema.parse(body);
-      const order = await createOrderWithPayment(data);
-      if (data.paymentMethod === 'OFFICIAL_BKASH') {
-        const bkash = await initiateOfficialBkashPayment({
-          paymentId: order.paymentId,
-          amount: order.totalAmount,
-          merchantInvoiceNumber: order.orderNumber,
-          callbackUrl: `${process.env.APP_URL || 'http://localhost:3000'}/api/v1/payments/bkash-callback`,
-        });
-        return NextResponse.json({ ...order, bkash }, { status: 201 });
-      }
-      return NextResponse.json(order, { status: 201 });
-    }
-
-    // PAYMENT VERIFICATION (MANUAL BKASH)
-    if (segs[0] === 'payments' && segs[2] === 'verify' && segs[1]) {
-      const user = await requireAuth();
-      const payRes = await db.query<{ purpose: string; store_id: string }>('SELECT purpose, store_id FROM payments WHERE id = ?', [segs[1]]);
-      const pay = payRes.rows[0];
-      if (!pay) return NextResponse.json({ error: 'Payment not found' }, { status: 404 });
-      if (pay.purpose === 'STORE_SUBSCRIPTION') {
-        await requireSuperAdmin();
-      } else {
-        await requireStoreAccess(user, pay.store_id, ['OWNER', 'MANAGER']);
-      }
-      await verifyManualPayment({
-        paymentId: segs[1],
-        actorUserId: user.id,
-        decision: body.decision === 'REJECT' ? 'REJECT' : 'APPROVE',
-        reason: body.reason,
-      });
-      return NextResponse.json({ ok: true });
-    }
-
-    // SUBSCRIPTION UPGRADE (STORE_SUBSCRIPTION PURPOSE ONLY)
-    if (route === 'subscriptions/upgrade') {
-      const user = await requireAuth();
-      const storeId = String(body.storeId || '');
-      const planCode = String(body.planCode || '');
-      await requireStoreAccess(user, storeId, ['OWNER']);
-
-      const planRes = await db.query<{ id: string; price_monthly: string }>('SELECT id, price_monthly FROM subscription_plans WHERE code = ? LIMIT 1', [planCode]);
-      const plan = planRes.rows[0];
-      if (!plan) return NextResponse.json({ error: 'Plan not found' }, { status: 404 });
-
-      const subId = generateUuid();
-      const invId = generateUuid();
-      const payId = generateUuid();
-      const invNumber = `INV-${Date.now()}`;
-
-      await db.transaction(async (tx) => {
-        await tx.execute(
-          `INSERT INTO store_subscriptions (id, store_id, plan_id, status, billing_cycle) VALUES (?, ?, ?, 'PENDING', 'MONTHLY')`,
-          [subId, storeId, plan.id]
-        );
-        await tx.execute(
-          `INSERT INTO subscription_invoices (id, store_id, subscription_id, invoice_number, amount, currency, status, due_at) VALUES (?, ?, ?, ?, ?, 'BDT', 'PENDING', ?)`,
-          [invId, storeId, subId, invNumber, plan.price_monthly, new Date(Date.now() + 3 * 86400_000)]
-        );
-        await tx.execute(
-          `INSERT INTO payments (id, purpose, store_id, invoice_id, method, gateway, trx_id, sender_number, amount, currency, status) VALUES (?, 'STORE_SUBSCRIPTION', ?, ?, 'MANUAL_BKASH', 'bkash', ?, ?, ?, 'BDT', 'PENDING_VERIFICATION')`,
-          [payId, storeId, invId, String(body.trxId || '').trim(), String(body.senderNumber || '').trim(), plan.price_monthly]
-        );
-      });
-
-      return NextResponse.json({ subscriptionId: subId, invoiceNumber: invNumber, paymentId: payId }, { status: 201 });
-    }
-
-    // AI WEBSITE ANALYZER & CHAT
-    if (route === 'ai/analyze') {
-      if (!checkRateLimit(`ai:${ip}`, 12, 60_000)) return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
-      const data = aiAnalyzeSchema.parse(body);
-      const result = await analyzeWebsiteSafely(data.url, currentUser?.id);
-      return NextResponse.json(result);
-    }
-
-    if (route === 'ai/chat') {
-      const data = aiChatSchema.parse(body);
-      const reply = await answerGroundedQuestion(data);
-      return NextResponse.json(reply);
-    }
-
-    // SUPER ADMIN CONTROLS
-    if (segs[0] === 'super-admin' && segs[1] === 'stores' && segs[3] === 'status') {
-      const admin = await requireSuperAdmin();
-      const status = String(body.status || 'ACTIVE');
-      if (!['ACTIVE', 'SUSPENDED', 'PENDING', 'ARCHIVED'].includes(status)) {
-        return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
-      }
-      await db.execute('UPDATE stores SET status = ?, updated_at = ? WHERE id = ?', [status, new Date(), segs[2]]);
-      await writeAuditLog({ actorUserId: admin.id, storeId: segs[2], action: `STORE_${status}`, targetType: 'store', targetId: segs[2] });
-      return NextResponse.json({ ok: true });
-    }
-
-    if (segs[0] === 'super-admin' && segs[1] === 'domains' && segs[3] === 'verify') {
-      const admin = await requireSuperAdmin();
-      const status = body.status === 'FAILED' ? 'FAILED' : 'VERIFIED';
-      await db.execute('UPDATE domains SET status = ?, verified_at = ? WHERE id = ?', [
+        params.ownerId,
+        params.name,
+        slug,
+        params.tagline || `${params.name} - Official Online Shop`,
+        params.description || `${params.name} online store built with BongoCommerce.`,
         status,
-        status === 'VERIFIED' ? new Date() : null,
-        segs[2],
-      ]);
-      await writeAuditLog({ actorUserId: admin.id, action: `DOMAIN_${status}`, targetType: 'domain', targetId: segs[2] });
-      return NextResponse.json({ ok: true });
-    }
+        db.engine === 'postgresql' ? isPublished : isPublished ? 1 : 0,
+        params.contactEmail || null,
+        params.contactPhone || null,
+        JSON.stringify(DEFAULT_THEME),
+        JSON.stringify(defaultHomepageBlocks(params.name, params.tagline)),
+      ]
+    );
 
-    if (route === 'super-admin/database/test') {
-      await requireSuperAdmin();
-      const cfg = dbConfigSchema.parse(body);
-      const result = await testDatabaseConnection(cfg);
-      return NextResponse.json(result);
-    }
+    await tx.execute(
+      `INSERT INTO store_members (id, store_id, user_id, role, permissions_json) VALUES (?, ?, ?, 'OWNER', '["*"]')`,
+      [generateUuid(), storeId, params.ownerId]
+    );
 
-    if (route === 'super-admin/database/migrate') {
-      const admin = await requireSuperAdmin();
-      const res = await runMigrations();
-      await writeAuditLog({ actorUserId: admin.id, action: 'DB_MIGRATION_RUN', targetType: 'database', metadata: res });
-      return NextResponse.json(res);
-    }
-
-    if (route === 'super-admin/database/switch') {
-      if (!checkRateLimit(`dbswitch:${ip}`, 3, 300_000)) return NextResponse.json({ error: 'Too many switch attempts' }, { status: 429 });
-      const admin = await requireSuperAdmin();
-      const data = dbSwitchRequestSchema.parse(body);
-
-      // Mandatory Re-authentication check
-      const adminRow = await db.query<{ password_hash: string }>('SELECT password_hash FROM users WHERE id = ? LIMIT 1', [admin.id]);
-      if (!adminRow.rows[0] || !verifyPassword(data.reauthPassword, adminRow.rows[0].password_hash)) {
-        return NextResponse.json({ error: 'Re-authentication password is incorrect' }, { status: 403 });
-      }
-
-      const result = await executeZeroDataLossDbSwitch(
-        {
-          engine: data.engine,
-          host: data.host,
-          port: data.port,
-          database: data.database,
-          username: data.username,
-          password: data.password,
-          ssl: data.ssl,
-        },
-        admin.id
+    const freePlan = await tx.query<{ id: string }>(
+      `SELECT id FROM subscription_plans WHERE code = 'FREE' LIMIT 1`
+    );
+    if (freePlan.rows[0]) {
+      await tx.execute(
+        `INSERT INTO store_subscriptions (id, store_id, plan_id, status, billing_cycle, starts_at)
+         VALUES (?, ?, ?, 'ACTIVE', 'MONTHLY', ?)`,
+        [generateUuid(), storeId, freePlan.rows[0].id, new Date()]
       );
-      return NextResponse.json(result, { status: result.success ? 200 : 500 });
     }
 
-    if (route === 'super-admin/backups') {
-      const admin = await requireSuperAdmin();
-      const backup = await createEncryptedDatabaseBackup(admin.id);
-      return NextResponse.json(backup, { status: 201 });
-    }
+    await tx.execute(
+      `INSERT INTO store_pages (id, store_id, title, slug, blocks_json, is_published) VALUES (?, ?, 'About Us', 'about', ?, ?)`,
+      [
+        generateUuid(),
+        storeId,
+        JSON.stringify([
+          {
+            id: 'about-1',
+            type: 'rich_text',
+            enabled: true,
+            title: 'আমাদের সম্পর্কে',
+            content: `${params.name}-এ আপনাকে স্বাগতম।`,
+          },
+        ]),
+        db.engine === 'postgresql' ? true : 1,
+      ]
+    );
+  });
 
-    if (route === 'super-admin/backups/restore') {
-      const admin = await requireSuperAdmin();
-      const result = await restoreEncryptedBackup(String(body.filename || ''), admin.id);
-      return NextResponse.json(result);
-    }
+  await writeAuditLog({
+    actorUserId: params.ownerId,
+    storeId,
+    action: 'STORE_CREATED',
+    targetType: 'store',
+    targetId: storeId,
+    metadata: { slug, status },
+  });
 
-    return NextResponse.json({ error: 'Endpoint not found' }, { status: 404 });
-  } catch (err) {
-    return handleError(err);
-  }
+  return {
+    storeId,
+    slug,
+    storeUrl: `/${slug}/`,
+    adminUrl: `/dashboard?storeId=${storeId}`,
+  };
 }
 
-export const POST = handleMutation;
-export const PATCH = handleMutation;
-export const DELETE = handleMutation;
+export async function createOrUpdateProduct(params: {
+  storeId: string;
+  productId?: string;
+  name: string;
+  slug?: string;
+  categoryId?: string | null;
+  sku?: string;
+  description: string;
+  price: string | number;
+  compareAtPrice?: string | number | null;
+  stock: number;
+  isDigital: boolean;
+  digitalFileKey?: string | null;
+  images: string[];
+  seoTitle?: string;
+  seoDescription?: string;
+  isActive: boolean;
+  createGlobalShortUrl?: boolean;
+}): Promise<{ id: string; slug: string; globalAlias: string | null }> {
+  const db = getDb();
+  const limits = await getStorePlanLimits(params.storeId);
+
+  if (!params.productId) {
+    const countRes = await db.query<{ cnt: string | number }>(
+      'SELECT COUNT(*) AS cnt FROM products WHERE store_id = ?',
+      [params.storeId]
+    );
+    if (Number(countRes.rows[0]?.cnt || 0) >= limits.maxProducts) {
+      throw new Error(`Plan limit reached: max ${limits.maxProducts} products allowed.`);
+    }
+  }
+
+  const storeRes = await db.query<{ slug: string }>('SELECT slug FROM stores WHERE id = ? LIMIT 1', [
+    params.storeId,
+  ]);
+  const storeSlug = storeRes.rows[0]?.slug || 'shop';
+  let desiredSlug = toSlug(params.slug || params.name);
+
+  if (params.productId) {
+    const oldRes = await db.query<{ slug: string; global_alias: string | null }>(
+      'SELECT slug, global_alias FROM products WHERE id = ? AND store_id = ? LIMIT 1',
+      [params.productId, params.storeId]
+    );
+    const oldProd = oldRes.rows[0];
+    if (!oldProd) throw new Error('Product not found in this store');
+
+    if (oldProd.slug !== desiredSlug) {
+      const clash = await db.query<{ id: string }>(
+        'SELECT id FROM products WHERE store_id = ? AND slug = ? AND id <> ? LIMIT 1',
+        [params.storeId, desiredSlug, params.productId]
+      );
+      if (clash.rows.length > 0) desiredSlug = `${desiredSlug}-${Date.now().toString().slice(-4)}`;
+
+      await db.execute(
+        `INSERT INTO url_redirects (id, store_id, old_path, new_path, status_code) VALUES (?, ?, ?, ?, 301)`,
+        [generateUuid(), params.storeId, `/${storeSlug}/${oldProd.slug}`, `/${storeSlug}/${desiredSlug}`]
+      );
+    }
+
+    await db.execute(
+      `UPDATE products SET category_id=?, name=?, slug=?, sku=?, description=?, price=?, compare_at_price=?, stock=?, is_digital=?, digital_file_key=?, images_json=?, seo_title=?, seo_description=?, is_active=?, updated_at=?
+       WHERE id = ? AND store_id = ?`,
+      [
+        params.categoryId || null,
+        params.name,
+        desiredSlug,
+        params.sku || null,
+        sanitizeRichText(params.description),
+        Number(params.price).toFixed(2),
+        params.compareAtPrice != null ? Number(params.compareAtPrice).toFixed(2) : null,
+        params.stock,
+        boolVal(params.isDigital),
+        params.digitalFileKey || null,
+        JSON.stringify(params.images),
+        params.seoTitle || params.name,
+        params.seoDescription || null,
+        boolVal(params.isActive),
+        new Date(),
+        params.productId,
+        params.storeId,
+      ]
+    );
+
+    return { id: params.productId, slug: desiredSlug, globalAlias: oldProd.global_alias };
+  }
+
+  const clash = await db.query<{ id: string }>(
+    'SELECT id FROM products WHERE store_id = ? AND slug = ? LIMIT 1',
+    [params.storeId, desiredSlug]
+  );
+  if (clash.rows.length > 0) desiredSlug = `${desiredSlug}-${Date.now().toString().slice(-4)}`;
+
+  const globalAlias =
+    params.createGlobalShortUrl !== false ? await generateUniqueGlobalAlias(params.name) : null;
+  const id = generateUuid();
+
+  await db.execute(
+    `INSERT INTO products (id, store_id, category_id, name, slug, global_alias, sku, description, price, compare_at_price, stock, is_digital, digital_file_key, images_json, seo_title, seo_description, is_active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      params.storeId,
+      params.categoryId || null,
+      params.name,
+      desiredSlug,
+      globalAlias,
+      params.sku || null,
+      sanitizeRichText(params.description),
+      Number(params.price).toFixed(2),
+      params.compareAtPrice != null ? Number(params.compareAtPrice).toFixed(2) : null,
+      params.stock,
+      boolVal(params.isDigital),
+      params.digitalFileKey || null,
+      JSON.stringify(params.images),
+      params.seoTitle || params.name,
+      params.seoDescription || null,
+      boolVal(params.isActive),
+    ]
+  );
+
+  return { id, slug: desiredSlug, globalAlias };
+}
+
+export async function createOrderWithPayment(input: {
+  storeId: string;
+  customerName: string;
+  customerEmail: string;
+  customerPhone: string;
+  shippingAddress: string;
+  couponCode?: string;
+  paymentMethod: 'MANUAL_BKASH' | 'OFFICIAL_BKASH' | 'CASH_ON_DELIVERY';
+  manualBkash?: { trxId: string; senderNumber: string };
+  notes?: string;
+  items: Array<{ productId: string; quantity: number }>;
+}): Promise<{
+  orderId: string;
+  orderNumber: string;
+  totalAmount: string;
+  paymentId: string;
+  paymentStatus: string;
+  bkashRedirectUrl?: string;
+}> {
+  const db = getDb();
+
+  if (
+    input.paymentMethod === 'MANUAL_BKASH' &&
+    (!input.manualBkash?.trxId || !input.manualBkash?.senderNumber)
+  ) {
+    throw new Error('Manual bKash requires Transaction ID and Sender Number');
+  }
+
+  return db.transaction(async (tx) => {
+    let subtotal = 0;
+    const resolvedItems: Array<{
+      productId: string;
+      name: string;
+      price: number;
+      quantity: number;
+      isDigital: boolean;
+    }> = [];
+
+    for (const item of input.items) {
+      const pRes = await tx.query<{
+        id: string;
+        name: string;
+        price: string;
+        stock: number;
+        is_digital: boolean | number;
+        is_active: boolean | number;
+      }>(
+        'SELECT id, name, price, stock, is_digital, is_active FROM products WHERE id = ? AND store_id = ? LIMIT 1',
+        [item.productId, input.storeId]
+      );
+      const prod = pRes.rows[0];
+      if (!prod || !prod.is_active) throw new Error('One or more products are unavailable');
+      if (!prod.is_digital && prod.stock < item.quantity) {
+        throw new Error(`Insufficient stock for ${prod.name}`);
+      }
+      const unit = Number(prod.price);
+      subtotal += unit * item.quantity;
+      resolvedItems.push({
+        productId: prod.id,
+        name: prod.name,
+        price: unit,
+        quantity: item.quantity,
+        isDigital: Boolean(prod.is_digital),
+      });
+
+      if (!prod.is_digital) {
+        await tx.execute('UPDATE products SET stock = stock - ? WHERE id = ? AND store_id = ?', [
+          item.quantity,
+          prod.id,
+          input.storeId,
+        ]);
+      }
+    }
+
+    let discount = 0;
+    if (input.couponCode) {
+      const cRes = await tx.query<{
+        id: string;
+        discount_type: 'PERCENT' | 'FIXED';
+        discount_value: string;
+        min_order_amount: string;
+        max_uses: number | null;
+        used_count: number;
+        expires_at: string | null;
+        is_active: boolean | number;
+      }>('SELECT * FROM coupons WHERE store_id = ? AND code = ? LIMIT 1', [
+        input.storeId,
+        input.couponCode.toUpperCase(),
+      ]);
+      const c = cRes.rows[0];
+      if (c && c.is_active && subtotal >= Number(c.min_order_amount)) {
+        if (
+          (!c.expires_at || new Date(c.expires_at) > new Date()) &&
+          (!c.max_uses || c.used_count < c.max_uses)
+        ) {
+          discount =
+            c.discount_type === 'PERCENT'
+              ? (subtotal * Number(c.discount_value)) / 100
+              : Number(c.discount_value);
+          discount = Math.min(discount, subtotal);
+          await tx.execute('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?', [c.id]);
+        }
+      }
+    }
+
+    const total = Math.max(0, subtotal - discount);
+    const orderId = generateUuid();
+    const orderNumber = `ORD-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+
+    let customerId: string;
+    const custRes = await tx.query<{ id: string }>(
+      'SELECT id FROM customers WHERE store_id = ? AND email = ? LIMIT 1',
+      [input.storeId, input.customerEmail]
+    );
+    if (custRes.rows[0]) {
+      customerId = custRes.rows[0].id;
+    } else {
+      customerId = generateUuid();
+      await tx.execute(
+        'INSERT INTO customers (id, store_id, name, email, phone, address) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          customerId,
+          input.storeId,
+          input.customerName,
+          input.customerEmail,
+          input.customerPhone,
+          input.shippingAddress,
+        ]
+      );
+    }
+
+    const initialPayStatus =
+      input.paymentMethod === 'MANUAL_BKASH' ? 'PENDING_VERIFICATION' : 'PENDING';
+
+    await tx.execute(
+      `INSERT INTO orders (id, store_id, customer_id, order_number, customer_name, customer_email, customer_phone, shipping_address, subtotal, discount_amount, shipping_fee, total_amount, currency, coupon_code, status, payment_status, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.00, ?, 'BDT', ?, 'PENDING', ?, ?)`,
+      [
+        orderId,
+        input.storeId,
+        customerId,
+        orderNumber,
+        input.customerName,
+        input.customerEmail,
+        input.customerPhone,
+        input.shippingAddress,
+        subtotal.toFixed(2),
+        discount.toFixed(2),
+        total.toFixed(2),
+        input.couponCode || null,
+        initialPayStatus,
+        input.notes || null,
+      ]
+    );
+
+    for (const ri of resolvedItems) {
+      await tx.execute(
+        `INSERT INTO order_items (id, order_id, store_id, product_id, product_name, unit_price, quantity, line_total, is_digital, digital_download_token)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          generateUuid(),
+          orderId,
+          input.storeId,
+          ri.productId,
+          ri.name,
+          ri.price.toFixed(2),
+          ri.quantity,
+          (ri.price * ri.quantity).toFixed(2),
+          tx.engine === 'postgresql' ? ri.isDigital : ri.isDigital ? 1 : 0,
+          ri.isDigital ? generateToken(24) : null,
+        ]
+      );
+    }
+
+    const paymentId = generateUuid();
+    await tx.execute(
+      `INSERT INTO payments (id, purpose, store_id, order_id, method, gateway, trx_id, sender_number, amount, currency, status, idempotency_key)
+       VALUES (?, 'STORE_ORDER', ?, ?, ?, ?, ?, ?, ?, 'BDT', ?, ?)`,
+      [
+        paymentId,
+        input.storeId,
+        orderId,
+        input.paymentMethod,
+        input.paymentMethod === 'CASH_ON_DELIVERY' ? 'cod' : 'bkash',
+        input.manualBkash?.trxId?.trim() || null,
+        input.manualBkash?.senderNumber?.trim() || null,
+        total.toFixed(2),
+        initialPayStatus,
+        `ord_${orderId}`,
+      ]
+    );
+
+    return {
+      orderId,
+      orderNumber,
+      totalAmount: total.toFixed(2),
+      paymentId,
+      paymentStatus: initialPayStatus,
+    };
+  });
+}
+
+export async function verifyManualPayment(params: {
+  paymentId: string;
+  actorUserId: string;
+  decision: 'APPROVE' | 'REJECT';
+  reason?: string;
+}): Promise<void> {
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    const pRes = await tx.query<{
+      id: string;
+      purpose: 'STORE_ORDER' | 'STORE_SUBSCRIPTION';
+      store_id: string;
+      order_id: string | null;
+      invoice_id: string | null;
+      status: string;
+    }>('SELECT id, purpose, store_id, order_id, invoice_id, status FROM payments WHERE id = ? LIMIT 1', [
+      params.paymentId,
+    ]);
+    const pay = pRes.rows[0];
+    if (!pay) throw new Error('Payment not found');
+    if (pay.status === 'PAID') throw new Error('Payment already verified as PAID');
+
+    const newStatus = params.decision === 'APPROVE' ? 'PAID' : 'REJECTED';
+    await tx.execute(
+      'UPDATE payments SET status = ?, verified_by = ?, verified_at = ?, rejection_reason = ?, updated_at = ? WHERE id = ?',
+      [newStatus, params.actorUserId, new Date(), params.reason || null, new Date(), pay.id]
+    );
+
+    if (pay.purpose === 'STORE_ORDER' && pay.order_id) {
+      await tx.execute(
+        'UPDATE orders SET payment_status = ?, status = ?, updated_at = ? WHERE id = ? AND store_id = ?',
+        [
+          newStatus,
+          params.decision === 'APPROVE' ? 'CONFIRMED' : 'PENDING',
+          new Date(),
+          pay.order_id,
+          pay.store_id,
+        ]
+      );
+    } else if (pay.purpose === 'STORE_SUBSCRIPTION' && pay.invoice_id) {
+      if (params.decision === 'APPROVE') {
+        await tx.execute("UPDATE subscription_invoices SET status = 'PAID', paid_at = ? WHERE id = ?", [
+          new Date(),
+          pay.invoice_id,
+        ]);
+        const inv = await tx.query<{ subscription_id: string }>(
+          'SELECT subscription_id FROM subscription_invoices WHERE id = ?',
+          [pay.invoice_id]
+        );
+        if (inv.rows[0]) {
+          const nextMonth = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+          await tx.execute(
+            "UPDATE store_subscriptions SET status = 'ACTIVE', ends_at = ?, updated_at = ? WHERE id = ?",
+            [nextMonth, new Date(), inv.rows[0].subscription_id]
+          );
+        }
+      }
+    }
+  });
+
+  await writeAuditLog({
+    actorUserId: params.actorUserId,
+    action: `PAYMENT_${params.decision}`,
+    targetType: 'payment',
+    targetId: params.paymentId,
+    metadata: { reason: params.reason },
+  });
+}
+
+export async function initiateOfficialBkashPayment(params: {
+  paymentId: string;
+  amount: string;
+  merchantInvoiceNumber: string;
+  callbackUrl: string;
+}): Promise<{ configured: boolean; bkashURL?: string; paymentID?: string; message: string }> {
+  const appKey = process.env.BKASH_APP_KEY;
+  const appSecret = process.env.BKASH_APP_SECRET;
+  const username = process.env.BKASH_USERNAME;
+  const password = process.env.BKASH_PASSWORD;
+  const baseUrl = process.env.BKASH_BASE_URL || 'https://tokenized.sandbox.bka.sh/v1.2.0-beta';
+
+  if (!appKey || !appSecret || !username || !password) {
+    return {
+      configured: false,
+      message:
+        'Official bKash credentials are not configured in .env. Please set BKASH_APP_KEY, BKASH_APP_SECRET, BKASH_USERNAME, and BKASH_PASSWORD or use Manual bKash.',
+    };
+  }
+
+  const tokenRes = await fetch(`${baseUrl}/tokenized/checkout/token/grant`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      username,
+      password,
+    },
+    body: JSON.stringify({ app_key: appKey, app_secret: appSecret }),
+  });
+
+  const tokenData = (await tokenRes.json()) as { id_token?: string; statusMessage?: string };
+  if (!tokenData.id_token) {
+    throw new Error(`bKash token grant failed: ${tokenData.statusMessage || 'Unknown error'}`);
+  }
+
+  const createRes = await fetch(`${baseUrl}/tokenized/checkout/create`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      Authorization: tokenData.id_token,
+      'X-APP-Key': appKey,
+    },
+    body: JSON.stringify({
+      mode: '0011',
+      payerReference: params.merchantInvoiceNumber,
+      callbackURL: params.callbackUrl,
+      amount: params.amount,
+      currency: 'BDT',
+      intent: 'sale',
+      merchantInvoiceNumber: params.merchantInvoiceNumber,
+    }),
+  });
+
+  const createData = (await createRes.json()) as {
+    bkashURL?: string;
+    paymentID?: string;
+    statusMessage?: string;
+  };
+  if (!createData.bkashURL || !createData.paymentID) {
+    throw new Error(`bKash create payment failed: ${createData.statusMessage || 'Unknown error'}`);
+  }
+
+  const db = getDb();
+  await db.execute('UPDATE payments SET gateway_payment_id = ?, raw_payload_json = ? WHERE id = ?', [
+    createData.paymentID,
+    JSON.stringify(createData),
+    params.paymentId,
+  ]);
+
+  return {
+    configured: true,
+    bkashURL: createData.bkashURL,
+    paymentID: createData.paymentID,
+    message: 'Redirect user to bkashURL to complete payment.',
+  };
+}
+
+function isPrivateIp(ip: string): boolean {
+  if (net.isIPv4(ip)) {
+    const parts = ip.split('.').map(Number);
+    if (parts[0] === 10 || parts[0] === 127 || parts[0] === 0) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
+    return false;
+  }
+  if (net.isIPv6(ip)) {
+    const lower = ip.toLowerCase();
+    return (
+      lower === '::1' ||
+      lower.startsWith('fc') ||
+      lower.startsWith('fd') ||
+      lower.startsWith('fe80') ||
+      lower.startsWith('::ffff:127.') ||
+      lower.startsWith('::ffff:10.') ||
+      lower.startsWith('::ffff:192.168.')
+    );
+  }
+  return true;
+}
+
+async function assertSafePublicUrl(rawUrl: string): Promise<URL> {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only HTTP and HTTPS protocols are permitted');
+  }
+  const hostname = parsed.hostname;
+  if (!hostname || hostname === 'localhost') {
+    throw new Error('Localhost and internal addresses are blocked');
+  }
+  if (net.isIP(hostname)) {
+    if (isPrivateIp(hostname)) {
+      throw new Error('Private/internal IP addresses are blocked (SSRF protection)');
+    }
+    return parsed;
+  }
+  const records = await dns.lookup(hostname, { all: true });
+  if (records.length === 0) throw new Error('Hostname could not be resolved');
+  for (const r of records) {
+    if (isPrivateIp(r.address)) {
+      throw new Error('Resolved IP belongs to a private or reserved network (SSRF protection)');
+    }
+  }
+  return parsed;
+}
+
+export async function analyzeWebsiteSafely(rawUrl: string, userId?: string | null): Promise<{
+  analysisId: string;
+  analysis: VerifiedWebsiteAnalysis;
+}> {
+  let currentUrl = (await assertSafePublicUrl(rawUrl)).toString();
+  let response: Response | null = null;
+
+  for (let hop = 0; hop < 3; hop++) {
+    await assertSafePublicUrl(currentUrl);
+    response = await fetch(currentUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      signal: AbortSignal.timeout(10_000),
+      headers: {
+        'User-Agent': 'BongoCommerce-Analyzer/1.0 (Public-Metadata-Reader)',
+        Accept: 'text/html,application/xhtml+xml',
+      },
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const loc = response.headers.get('location');
+      if (!loc) break;
+      currentUrl = new URL(loc, currentUrl).toString();
+      continue;
+    }
+    break;
+  }
+
+  const analysisId = generateUuid();
+  if (!response || !response.ok) {
+    const blocked: VerifiedWebsiteAnalysis = {
+      url: rawUrl,
+      finalUrl: currentUrl,
+      accessible: false,
+      statusCode: response?.status || 0,
+      blockedReason: `Website returned HTTP ${response?.status || 'Network Error'}. Protected or inaccessible sites are never bypassed.`,
+      websiteName: null,
+      title: null,
+      description: null,
+      category: null,
+      branding: { logoUrl: null, themeColor: null },
+      navigationLinks: [],
+      contactInfo: { emails: [], phones: [] },
+      products: [],
+      seo: { canonical: null, ogTitle: null, ogDescription: null },
+      analyzedAt: new Date().toISOString(),
+    };
+    await getDb().execute(
+      `INSERT INTO ai_website_analyses (id, user_id, target_url, final_url, accessible, status_code, verified_data_json, ai_summary)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        analysisId,
+        userId || null,
+        rawUrl,
+        currentUrl,
+        boolVal(false),
+        blocked.statusCode,
+        JSON.stringify(blocked),
+        blocked.blockedReason,
+      ]
+    );
+    return { analysisId, analysis: blocked };
+  }
+
+  const text = (await response.text()).slice(0, 1_500_000);
+  const $ = cheerio.load(text);
+  $('script:not([type="application/ld+json"]), style, noscript').remove();
+
+  const title = $('title').first().text().trim() || null;
+  const ogTitle = $('meta[property="og:title"]').attr('content')?.trim() || null;
+  const ogDesc =
+    $('meta[property="og:description"]').attr('content')?.trim() ||
+    $('meta[name="description"]').attr('content')?.trim() ||
+    null;
+  const siteName = $('meta[property="og:site_name"]').attr('content')?.trim() || title;
+  const themeColor = $('meta[name="theme-color"]').attr('content')?.trim() || null;
+  const canonical = $('link[rel="canonical"]').attr('href')?.trim() || null;
+  const logoRaw =
+    $('meta[property="og:image"]').attr('content') ||
+    $('link[rel="icon"]').attr('href') ||
+    $('img[alt*="logo" i]').first().attr('src') ||
+    null;
+  const logoUrl = logoRaw ? new URL(logoRaw, currentUrl).toString() : null;
+
+  const navigationLinks: Array<{ label: string; url: string }> = [];
+  $('header a, nav a')
+    .slice(0, 15)
+    .each((_, el) => {
+      const label = $(el).text().trim();
+      const href = $(el).attr('href');
+      if (label && href && !href.startsWith('javascript:')) {
+        try {
+          navigationLinks.push({
+            label: label.slice(0, 60),
+            url: new URL(href, currentUrl).toString(),
+          });
+        } catch {
+          // ignore invalid link
+        }
+      }
+    });
+
+  const bodyText = $('body').text();
+  const emails = Array.from(
+    new Set(bodyText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [])
+  ).slice(0, 5);
+  const phones = Array.from(new Set(bodyText.match(/(?:\+?880|0)1[3-9]\d{8}/g) || [])).slice(0, 5);
+
+  const products: VerifiedWebsiteAnalysis['products'] = [];
+  $('script[type="application/ld+json"]').each((_, el) => {
+    try {
+      const json = JSON.parse($(el).html() || '{}');
+      const items = Array.isArray(json) ? json : json['@graph'] ? json['@graph'] : [json];
+      for (const item of items) {
+        if (item?.['@type'] === 'Product' && item?.name) {
+          const offer = Array.isArray(item.offers) ? item.offers[0] : item.offers;
+          products.push({
+            name: String(item.name).slice(0, 160),
+            price: offer?.price != null ? String(offer.price) : null,
+            currency: offer?.priceCurrency || null,
+            description: item.description ? String(item.description).slice(0, 300) : null,
+            imageUrl:
+              typeof item.image === 'string'
+                ? item.image
+                : Array.isArray(item.image)
+                ? item.image[0]
+                : null,
+            productUrl: item.url ? new URL(item.url, currentUrl).toString() : currentUrl,
+            category: item.category ? String(item.category) : null,
+            source: 'json-ld',
+          });
+        }
+      }
+    } catch {
+      // ignore invalid json-ld
+    }
+  });
+
+  if (products.length === 0) {
+    $('[class*="product" i], article')
+      .slice(0, 12)
+      .each((_, el) => {
+        const name = $(el).find('h2, h3, h4, [class*="title" i]').first().text().trim();
+        const priceMatch = $(el).text().match(/(?:৳|BDT|Tk\.?|USD|\$)\s?[\d,]+(?:\.\d{1,2})?/i);
+        const href = $(el).find('a').first().attr('href');
+        const img = $(el).find('img').first().attr('src');
+        if (name && name.length >= 3) {
+          products.push({
+            name: name.slice(0, 140),
+            price: priceMatch ? priceMatch[0] : null,
+            currency: null,
+            description: null,
+            imageUrl: img ? new URL(img, currentUrl).toString() : null,
+            productUrl: href ? new URL(href, currentUrl).toString() : currentUrl,
+            category: null,
+            source: 'dom-heuristic',
+          });
+        }
+      });
+  }
+
+  const analysis: VerifiedWebsiteAnalysis = {
+    url: rawUrl,
+    finalUrl: currentUrl,
+    accessible: true,
+    statusCode: response.status,
+    websiteName: siteName,
+    title,
+    description: ogDesc,
+    category: products.length > 0 ? 'E-Commerce / Online Store' : 'General Website',
+    branding: { logoUrl, themeColor },
+    navigationLinks,
+    contactInfo: { emails, phones },
+    products: products.slice(0, 20),
+    seo: { canonical, ogTitle, ogDescription: ogDesc },
+    analyzedAt: new Date().toISOString(),
+  };
+
+  await getDb().execute(
+    `INSERT INTO ai_website_analyses (id, user_id, target_url, final_url, accessible, status_code, verified_data_json, ai_summary)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      analysisId,
+      userId || null,
+      rawUrl,
+      currentUrl,
+      boolVal(true),
+      response.status,
+      JSON.stringify(analysis),
+      `Verified ${analysis.products.length} product(s) from ${currentUrl}`,
+    ]
+  );
+
+  return { analysisId, analysis };
+}
+
+export async function answerGroundedQuestion(params: {
+  analysisId?: string;
+  storeId?: string;
+  question: string;
+  language: 'bn' | 'en';
+}): Promise<{ answer: string; sourceType: 'VERIFIED_DATA' | 'AI_WITH_VERIFIED_DATA'; hasWebsite: boolean }> {
+  const db = getDb();
+  let contextData: Record<string, unknown> = {};
+
+  if (params.analysisId) {
+    const res = await db.query<{ verified_data_json: string; accessible: boolean | number }>(
+      'SELECT verified_data_json, accessible FROM ai_website_analyses WHERE id = ? LIMIT 1',
+      [params.analysisId]
+    );
+    if (res.rows[0]) {
+      contextData = JSON.parse(res.rows[0].verified_data_json);
+    }
+  } else if (params.storeId) {
+    const [storeRes, prodRes] = await Promise.all([
+      db.query('SELECT id, name, slug, contact_email, contact_phone FROM stores WHERE id = ? LIMIT 1', [
+        params.storeId,
+      ]),
+      db.query(
+        'SELECT name, slug, price, stock FROM products WHERE store_id = ? AND is_active = ? LIMIT 30',
+        [params.storeId, boolVal(true)]
+      ),
+    ]);
+    contextData = { store: storeRes.rows[0], products: prodRes.rows };
+  }
+
+  const aiKey = process.env.AI_API_KEY;
+  if (!aiKey || process.env.AI_PROVIDER === 'none') {
+    const analysis = contextData as Partial<VerifiedWebsiteAnalysis>;
+    if (params.analysisId && analysis.accessible === false) {
+      return {
+        sourceType: 'VERIFIED_DATA',
+        hasWebsite: false,
+        answer:
+          params.language === 'bn'
+            ? `এই ওয়েবসাইটটি অ্যাক্সেস করা যায়নি (${analysis.blockedReason || 'Blocked'})। আপনার নিজের কোনো Website নেই? চিন্তা নেই! আপনার নাম দিয়ে এক ক্লিকেই নিজের Online Shop তৈরি করুন ("CREATE MY SHOP" বাটনে ক্লিক করে)।`
+            : `This website could not be accessed. Don't have a website? Click "CREATE MY SHOP" to launch your own store in one click!`,
+      };
+    }
+
+    const prods: Array<{ name: string; price?: string | null }> =
+      analysis.products ||
+      (contextData.products as Array<{ name: string; price?: string | null }>) ||
+      [];
+
+    const listText =
+      prods.length > 0
+        ? prods
+            .slice(0, 8)
+            .map((p, idx) => `${idx + 1}. ${p.name} — দাম: ${p.price || 'উল্লেখ নেই'}`)
+            .join('\n')
+        : params.language === 'bn'
+        ? 'এই পেজে সরাসরি যাচাইযোগ্য কোনো প্রোডাক্ট পাওয়া যায়নি।'
+        : 'No verifiable products found on this page.';
+
+    return {
+      sourceType: 'VERIFIED_DATA',
+      hasWebsite: true,
+      answer:
+        params.language === 'bn'
+          ? `যাচাইকৃত তথ্য (${analysis.finalUrl || 'Store DB'}):\n${listText}\n\n(শপ লিংক: ${analysis.finalUrl || '/'})`
+          : `Verified Data:\n${listText}`,
+    };
+  }
+
+  const baseUrl = process.env.AI_BASE_URL || 'https://api.openai.com/v1';
+  const model = process.env.AI_MODEL || 'gpt-4o-mini';
+  const llmRes = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${aiKey}` },
+    body: JSON.stringify({
+      model,
+      temperature: 0.1,
+      messages: [
+        {
+          role: 'system',
+          content: `You are BongoCommerce Assistant. Reply in ${params.language === 'bn' ? 'Bangla' : 'English'}. ONLY state prices, products, and links present in the VERIFIED_JSON below. Never guess or fabricate prices or stock.`,
+        },
+        {
+          role: 'user',
+          content: `VERIFIED_JSON:\n${JSON.stringify(contextData).slice(0, 12000)}\n\nQUESTION: ${params.question}`,
+        },
+      ],
+    }),
+  });
+  const llmJson = (await llmRes.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  return {
+    sourceType: 'AI_WITH_VERIFIED_DATA',
+    hasWebsite: true,
+    answer: llmJson.choices?.[0]?.message?.content || 'Unable to generate response.',
+  };
+}
+
+const MIGRATION_TABLE_ORDER = [
+  'users',
+  'sessions',
+  'subscription_plans',
+  'stores',
+  'store_members',
+  'store_subscriptions',
+  'subscription_invoices',
+  'domains',
+  'categories',
+  'products',
+  'url_redirects',
+  'store_pages',
+  'coupons',
+  'customers',
+  'orders',
+  'order_items',
+  'payments',
+  'product_reviews',
+  'wishlists',
+  'notifications',
+  'ai_website_analyses',
+  'system_settings',
+  'audit_logs',
+  'background_jobs',
+] as const;
+
+const BACKUPS_DIR = path.resolve(
+  process.cwd(),
+  process.env.LOCAL_STORAGE_PATH || './storage',
+  'backups'
+);
+
+export async function createEncryptedDatabaseBackup(createdBy: string): Promise<BackupMetadata> {
+  fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+  const db = getDb();
+  const { config } = getActiveDatabaseConfig();
+  const snapshot: Record<string, Record<string, unknown>[]> = {};
+  let totalRows = 0;
+
+  for (const table of MIGRATION_TABLE_ORDER) {
+    const res = await db.query(`SELECT * FROM ${table}`);
+    snapshot[table] = res.rows;
+    totalRows += res.rows.length;
+  }
+
+  const jsonBytes = Buffer.from(
+    JSON.stringify({ engine: db.engine, exportedAt: new Date().toISOString(), tables: snapshot })
+  );
+  const compressed = zlib.gzipSync(jsonBytes);
+  const sha256Checksum = sha256Hex(compressed);
+  const encryptedPayload = encryptSecret(compressed.toString('base64'));
+
+  const id = generateUuid();
+  const filename = `backup-${db.engine}-${Date.now()}.bongo.enc`;
+  const envelope = JSON.stringify({
+    id,
+    filename,
+    engine: db.engine,
+    databaseName: config.database,
+    sha256Checksum,
+    totalRows,
+    createdAt: new Date().toISOString(),
+    createdBy,
+    payload: encryptedPayload,
+  });
+  fs.writeFileSync(path.join(BACKUPS_DIR, filename), envelope, { mode: 0o600 });
+
+  await writeAuditLog({
+    actorUserId: createdBy,
+    action: 'BACKUP_CREATED',
+    targetType: 'backup',
+    targetId: filename,
+    metadata: { totalRows, sha256Checksum },
+  });
+
+  return {
+    id,
+    filename,
+    engine: db.engine,
+    databaseName: config.database,
+    sha256Checksum,
+    encrypted: true,
+    totalRows,
+    sizeBytes: Buffer.byteLength(envelope),
+    createdAt: new Date().toISOString(),
+    createdBy,
+  };
+}
+
+export function listBackups(): BackupMetadata[] {
+  if (!fs.existsSync(BACKUPS_DIR)) return [];
+  return fs
+    .readdirSync(BACKUPS_DIR)
+    .filter((f) => f.endsWith('.bongo.enc'))
+    .map((file) => {
+      const raw = JSON.parse(fs.readFileSync(path.join(BACKUPS_DIR, file), 'utf8'));
+      return {
+        id: raw.id,
+        filename: raw.filename,
+        engine: raw.engine,
+        databaseName: raw.databaseName,
+        sha256Checksum: raw.sha256Checksum,
+        encrypted: true,
+        totalRows: raw.totalRows,
+        sizeBytes: fs.statSync(path.join(BACKUPS_DIR, file)).size,
+        createdAt: raw.createdAt,
+        createdBy: raw.createdBy,
+      } as BackupMetadata;
+    })
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function restoreEncryptedBackup(
+  filename: string,
+  actorUserId: string
+): Promise<{ restoredRows: number }> {
+  const safeName = path.basename(filename);
+  const fullPath = path.join(BACKUPS_DIR, safeName);
+  if (!fs.existsSync(fullPath)) throw new Error('Backup file not found');
+
+  const envelope = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
+  const compressed = Buffer.from(decryptSecret(envelope.payload), 'base64');
+  if (sha256Hex(compressed) !== envelope.sha256Checksum) {
+    throw new Error('Backup integrity verification failed: SHA-256 checksum mismatch!');
+  }
+
+  await createEncryptedDatabaseBackup(actorUserId);
+
+  const parsed = JSON.parse(zlib.gunzipSync(compressed).toString('utf8')) as {
+    tables: Record<string, Record<string, unknown>[]>;
+  };
+
+  const db = getDb();
+  let restoredRows = 0;
+
+  setWriteFrozen(true);
+  try {
+    await db.transaction(async (tx) => {
+      for (const table of [...MIGRATION_TABLE_ORDER].reverse()) {
+        await tx.execute(`DELETE FROM ${table}`);
+      }
+      for (const table of MIGRATION_TABLE_ORDER) {
+        const rows = parsed.tables[table] || [];
+        for (const row of rows) {
+          const cols = Object.keys(row);
+          if (cols.length === 0) continue;
+          const placeholders = cols.map(() => '?').join(', ');
+          const vals = cols.map((c) => {
+            const v = row[c];
+            if (typeof v === 'boolean' && tx.engine !== 'postgresql') return v ? 1 : 0;
+            return v;
+          });
+          await tx.execute(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})`, vals);
+          restoredRows += 1;
+        }
+      }
+    });
+  } finally {
+    setWriteFrozen(false);
+  }
+
+  await writeAuditLog({
+    actorUserId,
+    action: 'BACKUP_RESTORED',
+    targetType: 'backup',
+    targetId: safeName,
+    metadata: { restoredRows },
+  });
+  return { restoredRows };
+}
+
+export async function executeZeroDataLossDbSwitch(
+  targetConfig: DatabaseConnectionConfig,
+  actorUserId: string
+): Promise<{ success: boolean; steps: MigrationStepReport[]; error?: string }> {
+  const steps: MigrationStepReport[] = [];
+  const logStep = (
+    step: number,
+    name: string,
+    status: MigrationStepReport['status'],
+    detail: string
+  ) => {
+    steps.push({ step, name, status, detail, timestamp: new Date().toISOString() });
+  };
+
+  const sourceDb = getDb();
+  const targetDb = createAdapterFromConfig(targetConfig);
+
+  try {
+    const backup = await createEncryptedDatabaseBackup(actorUserId);
+    logStep(1, 'Existing Database Backup', 'COMPLETED', `Backup ${backup.filename} (${backup.totalRows} rows)`);
+
+    const connTest = await testDatabaseConnection(targetConfig);
+    if (!connTest.ok) throw new Error(`Target connection failed: ${connTest.error}`);
+    logStep(2, 'Target Connection Test', 'COMPLETED', `Connected to ${targetConfig.engine} (${connTest.version})`);
+
+    await runMigrations(targetDb);
+    logStep(3, 'Target Schema Preparation', 'COMPLETED', 'DDL migrations and plans verified on target');
+
+    let copiedRows = 0;
+    await targetDb.transaction(async (tx) => {
+      for (const table of [...MIGRATION_TABLE_ORDER].reverse()) {
+        await tx.execute(`DELETE FROM ${table}`);
+      }
+      for (const table of MIGRATION_TABLE_ORDER) {
+        const srcRows = await sourceDb.query(`SELECT * FROM ${table}`);
+        for (const row of srcRows.rows) {
+          const cols = Object.keys(row);
+          if (cols.length === 0) continue;
+          const placeholders = cols.map(() => '?').join(', ');
+          const vals = cols.map((c) => {
+            const v = row[c];
+            if (typeof v === 'boolean' && tx.engine !== 'postgresql') return v ? 1 : 0;
+            if (
+              (c === 'is_active' ||
+                c === 'is_published' ||
+                c === 'is_digital' ||
+                c === 'is_primary' ||
+                c === 'is_read' ||
+                c === 'is_approved' ||
+                c === 'accessible' ||
+                c === 'is_secret' ||
+                c === 'auto_renew') &&
+              tx.engine === 'postgresql'
+            ) {
+              return Boolean(v);
+            }
+            return v;
+          });
+          await tx.execute(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})`, vals);
+          copiedRows += 1;
+        }
+      }
+    });
+    logStep(4, 'Initial Data Migration', 'COMPLETED', `Copied ${copiedRows} rows in FK order`);
+
+    for (const table of MIGRATION_TABLE_ORDER) {
+      const [sCnt, tCnt] = await Promise.all([
+        sourceDb.query<{ c: string | number }>(`SELECT COUNT(*) AS c FROM ${table}`),
+        targetDb.query<{ c: string | number }>(`SELECT COUNT(*) AS c FROM ${table}`),
+      ]);
+      if (Number(sCnt.rows[0]?.c || 0) !== Number(tCnt.rows[0]?.c || 0)) {
+        throw new Error(`Row count mismatch on table ${table}`);
+      }
+    }
+    const [sPaySum, tPaySum] = await Promise.all([
+      sourceDb.query<{ s: string | null }>('SELECT COALESCE(SUM(amount), 0) AS s FROM payments'),
+      targetDb.query<{ s: string | null }>('SELECT COALESCE(SUM(amount), 0) AS s FROM payments'),
+    ]);
+    if (Number(sPaySum.rows[0]?.s || 0).toFixed(2) !== Number(tPaySum.rows[0]?.s || 0).toFixed(2)) {
+      throw new Error('Payment decimal sum verification failed!');
+    }
+    logStep(5, 'Integrity & Payment Verification', 'COMPLETED', 'All table counts and payment totals matched 100%');
+
+    setWriteFrozen(true);
+    try {
+      saveActiveDatabaseConfig(targetConfig);
+      await reloadActiveDatabasePool();
+      const health = await getDb().getServerVersion();
+      logStep(6, 'Controlled Write Freeze & Cutover', 'COMPLETED', `Activated ${targetConfig.engine} (${health})`);
+    } finally {
+      setWriteFrozen(false);
+    }
+
+    await writeAuditLog({
+      actorUserId,
+      action: 'DATABASE_SWITCHED',
+      targetType: 'database',
+      targetId: targetConfig.database,
+      metadata: { targetEngine: targetConfig.engine, targetHost: targetConfig.host },
+    });
+
+    return { success: true, steps };
+  } catch (err) {
+    setWriteFrozen(false);
+    logStep(99, 'Switch Aborted — Old Database Retained', 'FAILED', err instanceof Error ? err.message : 'Unknown error');
+    return {
+      success: false,
+      steps,
+      error: err instanceof Error ? err.message : 'Migration failed; active database unchanged.',
+    };
+  } finally {
+    await targetDb.close().catch(() => undefined);
+  }
+}
