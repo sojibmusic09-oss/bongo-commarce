@@ -9,6 +9,21 @@ function getCsrfToken(): string {
   return m ? decodeURIComponent(m[1]) : '';
 }
 
+async function safeJsonFetch(url: string, options?: RequestInit) {
+  const res = await fetch(url, options);
+  const text = await res.text();
+  try {
+    const data = JSON.parse(text);
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return {
+      ok: false,
+      status: res.status,
+      data: { error: `সার্ভার API পাওয়া যায়নি (${res.status})।` },
+    };
+  }
+}
+
 export default function SuperAdminPage() {
   const [user, setUser] = useState<any>(null);
   const [loginForm, setLoginForm] = useState({ email: '', password: '' });
@@ -17,7 +32,6 @@ export default function SuperAdminPage() {
   const [msg, setMsg] = useState('');
   const [loading, setLoading] = useState(false);
 
-  // Database Switch Form
   const [dbForm, setDbForm] = useState({
     engine: 'mysql' as 'postgresql' | 'mysql' | 'mariadb',
     host: '127.0.0.1',
@@ -31,21 +45,16 @@ export default function SuperAdminPage() {
   });
   const [dbTestResult, setDbTestResult] = useState<any>(null);
   const [switchSteps, setSwitchSteps] = useState<any[]>([]);
-
-  // Admin Create Store Form
   const [newStore, setNewStore] = useState({ name: '', slug: '', tagline: '' });
 
   async function loadOverview() {
     setLoading(true);
     try {
-      const meRes = await fetch('/api/v1/auth/me');
-      const me = await meRes.json();
-      setUser(me.user || null);
-      if (me.user?.platform_role === 'SUPER_ADMIN') {
-        const res = await fetch('/api/v1/super-admin/overview');
-        if (res.ok) {
-          setData(await res.json());
-        }
+      const me = await safeJsonFetch('/api/v1/auth/me');
+      setUser(me.ok ? me.data.user || null : null);
+      if (me.ok && me.data.user?.platform_role === 'SUPER_ADMIN') {
+        const res = await safeJsonFetch('/api/v1/super-admin/overview');
+        if (res.ok) setData(res.data);
       }
     } finally {
       setLoading(false);
@@ -58,13 +67,12 @@ export default function SuperAdminPage() {
 
   async function apiMutate(url: string, method = 'POST', body: unknown = {}) {
     setMsg('');
-    const res = await fetch(url, {
+    const { ok, data: json } = await safeJsonFetch(url, {
       method,
       headers: { 'Content-Type': 'application/json', 'x-csrf-token': getCsrfToken() },
       body: JSON.stringify(body),
     });
-    const json = await res.json();
-    if (!res.ok) throw new Error(json.error || 'Action failed');
+    if (!ok) throw new Error(json.error || 'Action failed');
     return json;
   }
 
@@ -194,8 +202,22 @@ export default function SuperAdminPage() {
         <p className="mt-1 text-xs text-slate-500">সিস্টেম অ্যাডমিন অ্যাকাউন্ট দিয়ে লগইন করুন।</p>
         {msg && <p className="mt-3 rounded bg-red-50 p-2 text-xs text-red-700">{msg}</p>}
         <form onSubmit={handleLogin} className="mt-4 space-y-3">
-          <input required type="email" placeholder="Admin Email" value={loginForm.email} onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })} className="w-full rounded-lg border px-3 py-2 text-sm" />
-          <input required type="password" placeholder="Password" value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} className="w-full rounded-lg border px-3 py-2 text-sm" />
+          <input
+            required
+            type="email"
+            placeholder="Admin Email"
+            value={loginForm.email}
+            onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
+            className="w-full rounded-lg border px-3 py-2 text-sm"
+          />
+          <input
+            required
+            type="password"
+            placeholder="Password"
+            value={loginForm.password}
+            onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+            className="w-full rounded-lg border px-3 py-2 text-sm"
+          />
           <button type="submit" className="w-full rounded-lg bg-slate-900 py-2.5 text-sm font-semibold text-white">
             লগইন করুন
           </button>
@@ -220,12 +242,21 @@ export default function SuperAdminPage() {
         <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-3 px-4 py-3">
           <div>
             <h1 className="text-lg font-bold">Super Admin Console</h1>
-            <p className="text-xs text-slate-300">{user.email} | Active DB: {data?.dbStatus?.engine?.toUpperCase()}</p>
+            <p className="text-xs text-slate-300">
+              {user.email} | Active DB: {data?.dbStatus?.engine?.toUpperCase()}
+            </p>
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
-            <Link href="/" className="rounded bg-slate-700 px-3 py-1.5">Platform Home</Link>
-            <Link href="/dashboard" className="rounded bg-indigo-600 px-3 py-1.5">Owner View</Link>
-            <button onClick={() => apiMutate('/api/v1/auth/logout').then(() => setUser(null))} className="rounded bg-red-600 px-3 py-1.5">
+            <Link href="/" className="rounded bg-slate-700 px-3 py-1.5">
+              Platform Home
+            </Link>
+            <Link href="/dashboard" className="rounded bg-indigo-600 px-3 py-1.5">
+              Owner View
+            </Link>
+            <button
+              onClick={() => apiMutate('/api/v1/auth/logout').then(() => setUser(null))}
+              className="rounded bg-red-600 px-3 py-1.5"
+            >
               Logout
             </button>
           </div>
@@ -274,26 +305,67 @@ export default function SuperAdminPage() {
         {data && tab === 'stores' && (
           <div className="space-y-6">
             <form onSubmit={handleCreateStore} className="grid gap-2 rounded-xl bg-white p-4 shadow-sm md:grid-cols-4">
-              <input required placeholder="Store Name" value={newStore.name} onChange={(e) => setNewStore({ ...newStore, name: e.target.value })} className="rounded border px-3 py-2 text-sm" />
-              <input required placeholder="slug (e.g. techmart)" value={newStore.slug} onChange={(e) => setNewStore({ ...newStore, slug: e.target.value })} className="rounded border px-3 py-2 text-sm" />
-              <input placeholder="Tagline" value={newStore.tagline} onChange={(e) => setNewStore({ ...newStore, tagline: e.target.value })} className="rounded border px-3 py-2 text-sm" />
-              <button type="submit" className="rounded bg-indigo-600 px-4 py-2 text-sm font-semibold text-white">Admin Create Store</button>
+              <input
+                required
+                placeholder="Store Name"
+                value={newStore.name}
+                onChange={(e) => setNewStore({ ...newStore, name: e.target.value })}
+                className="rounded border px-3 py-2 text-sm"
+              />
+              <input
+                required
+                placeholder="slug (e.g. techmart)"
+                value={newStore.slug}
+                onChange={(e) => setNewStore({ ...newStore, slug: e.target.value })}
+                className="rounded border px-3 py-2 text-sm"
+              />
+              <input
+                placeholder="Tagline"
+                value={newStore.tagline}
+                onChange={(e) => setNewStore({ ...newStore, tagline: e.target.value })}
+                className="rounded border px-3 py-2 text-sm"
+              />
+              <button type="submit" className="rounded bg-indigo-600 px-4 py-2 text-sm font-semibold text-white">
+                Admin Create Store
+              </button>
             </form>
 
             <div className="overflow-auto rounded-xl bg-white p-4 shadow-sm">
               <h2 className="mb-3 font-bold">Stores ({data.stores.length})</h2>
               <table className="w-full text-left text-xs">
-                <thead><tr className="border-b"><th className="p-2">Name</th><th className="p-2">Slug</th><th className="p-2">Owner</th><th className="p-2">Status</th><th className="p-2">Actions</th></tr></thead>
+                <thead>
+                  <tr className="border-b">
+                    <th className="p-2">Name</th>
+                    <th className="p-2">Slug</th>
+                    <th className="p-2">Owner</th>
+                    <th className="p-2">Status</th>
+                    <th className="p-2">Actions</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {data.stores.map((s: any) => (
                     <tr key={s.id} className="border-b">
                       <td className="p-2 font-medium">{s.name}</td>
-                      <td className="p-2"><Link href={`/${s.slug}`} className="text-indigo-600 underline">/{s.slug}/</Link></td>
+                      <td className="p-2">
+                        <Link href={`/${s.slug}`} className="text-indigo-600 underline">
+                          /{s.slug}/
+                        </Link>
+                      </td>
                       <td className="p-2">{s.owner_email}</td>
                       <td className="p-2">{s.status}</td>
                       <td className="flex gap-1 p-2">
-                        <button onClick={() => handleStoreStatus(s.id, 'ACTIVE')} className="rounded bg-emerald-600 px-2 py-1 text-white">Activate</button>
-                        <button onClick={() => handleStoreStatus(s.id, 'SUSPENDED')} className="rounded bg-amber-600 px-2 py-1 text-white">Suspend</button>
+                        <button
+                          onClick={() => handleStoreStatus(s.id, 'ACTIVE')}
+                          className="rounded bg-emerald-600 px-2 py-1 text-white"
+                        >
+                          Activate
+                        </button>
+                        <button
+                          onClick={() => handleStoreStatus(s.id, 'SUSPENDED')}
+                          className="rounded bg-amber-600 px-2 py-1 text-white"
+                        >
+                          Suspend
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -304,7 +376,15 @@ export default function SuperAdminPage() {
             <div className="overflow-auto rounded-xl bg-white p-4 shadow-sm">
               <h2 className="mb-3 font-bold">Custom Domains ({data.domains.length})</h2>
               <table className="w-full text-left text-xs">
-                <thead><tr className="border-b"><th className="p-2">Hostname</th><th className="p-2">Store</th><th className="p-2">DNS TXT Token</th><th className="p-2">Status</th><th className="p-2">Action</th></tr></thead>
+                <thead>
+                  <tr className="border-b">
+                    <th className="p-2">Hostname</th>
+                    <th className="p-2">Store</th>
+                    <th className="p-2">DNS TXT Token</th>
+                    <th className="p-2">Status</th>
+                    <th className="p-2">Action</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {data.domains.map((d: any) => (
                     <tr key={d.id} className="border-b">
@@ -313,8 +393,18 @@ export default function SuperAdminPage() {
                       <td className="p-2 font-mono">{d.verification_token}</td>
                       <td className="p-2">{d.status}</td>
                       <td className="flex gap-1 p-2">
-                        <button onClick={() => handleVerifyDomain(d.id, 'VERIFIED')} className="rounded bg-emerald-600 px-2 py-1 text-white">Verify</button>
-                        <button onClick={() => handleVerifyDomain(d.id, 'FAILED')} className="rounded bg-red-600 px-2 py-1 text-white">Fail</button>
+                        <button
+                          onClick={() => handleVerifyDomain(d.id, 'VERIFIED')}
+                          className="rounded bg-emerald-600 px-2 py-1 text-white"
+                        >
+                          Verify
+                        </button>
+                        <button
+                          onClick={() => handleVerifyDomain(d.id, 'FAILED')}
+                          className="rounded bg-red-600 px-2 py-1 text-white"
+                        >
+                          Fail
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -328,7 +418,16 @@ export default function SuperAdminPage() {
           <div className="overflow-auto rounded-xl bg-white p-4 shadow-sm">
             <h2 className="mb-3 font-bold">All Payments (Order & Subscription Separated)</h2>
             <table className="w-full text-left text-xs">
-              <thead><tr className="border-b"><th className="p-2">Purpose</th><th className="p-2">Method</th><th className="p-2">TrxID</th><th className="p-2">Amount</th><th className="p-2">Status</th><th className="p-2">Verify</th></tr></thead>
+              <thead>
+                <tr className="border-b">
+                  <th className="p-2">Purpose</th>
+                  <th className="p-2">Method</th>
+                  <th className="p-2">TrxID</th>
+                  <th className="p-2">Amount</th>
+                  <th className="p-2">Status</th>
+                  <th className="p-2">Verify</th>
+                </tr>
+              </thead>
               <tbody>
                 {data.payments.map((p: any) => (
                   <tr key={p.id} className="border-b">
@@ -340,8 +439,18 @@ export default function SuperAdminPage() {
                     <td className="flex gap-1 p-2">
                       {p.status !== 'PAID' && (
                         <>
-                          <button onClick={() => handleVerifyPayment(p.id, 'APPROVE')} className="rounded bg-emerald-600 px-2 py-1 text-white">Approve</button>
-                          <button onClick={() => handleVerifyPayment(p.id, 'REJECT')} className="rounded bg-red-600 px-2 py-1 text-white">Reject</button>
+                          <button
+                            onClick={() => handleVerifyPayment(p.id, 'APPROVE')}
+                            className="rounded bg-emerald-600 px-2 py-1 text-white"
+                          >
+                            Approve
+                          </button>
+                          <button
+                            onClick={() => handleVerifyPayment(p.id, 'REJECT')}
+                            className="rounded bg-red-600 px-2 py-1 text-white"
+                          >
+                            Reject
+                          </button>
                         </>
                       )}
                     </td>
@@ -370,7 +479,12 @@ export default function SuperAdminPage() {
                   Run Schema Migrations
                 </button>
                 {data.phpMyAdminUrl && (
-                  <a href={data.phpMyAdminUrl} target="_blank" rel="noopener noreferrer" className="rounded bg-amber-600 px-3 py-1.5 text-xs text-white">
+                  <a
+                    href={data.phpMyAdminUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="rounded bg-amber-600 px-3 py-1.5 text-xs text-white"
+                  >
                     Open phpMyAdmin (External)
                   </a>
                 )}
@@ -379,34 +493,100 @@ export default function SuperAdminPage() {
 
             <form onSubmit={handleSwitchDatabase} className="space-y-3 rounded-xl bg-white p-5 shadow-sm">
               <h2 className="text-base font-bold">Zero-Data-Loss Database Switching (PG ↔ MySQL/MariaDB)</h2>
-              <select value={dbForm.engine} onChange={(e) => setDbForm({ ...dbForm, engine: e.target.value as any, port: e.target.value === 'postgresql' ? 5432 : 3306 })} className="w-full rounded border px-3 py-2 text-sm">
+              <select
+                value={dbForm.engine}
+                onChange={(e) =>
+                  setDbForm({
+                    ...dbForm,
+                    engine: e.target.value as any,
+                    port: e.target.value === 'postgresql' ? 5432 : 3306,
+                  })
+                }
+                className="w-full rounded border px-3 py-2 text-sm"
+              >
                 <option value="mysql">MySQL (cPanel Compatible)</option>
                 <option value="mariadb">MariaDB (cPanel Compatible)</option>
                 <option value="postgresql">PostgreSQL</option>
               </select>
               <div className="grid grid-cols-3 gap-2">
-                <input required placeholder="Host" value={dbForm.host} onChange={(e) => setDbForm({ ...dbForm, host: e.target.value })} className="col-span-2 rounded border px-3 py-2 text-sm" />
-                <input required type="number" placeholder="Port" value={dbForm.port} onChange={(e) => setDbForm({ ...dbForm, port: Number(e.target.value) })} className="rounded border px-3 py-2 text-sm" />
+                <input
+                  required
+                  placeholder="Host"
+                  value={dbForm.host}
+                  onChange={(e) => setDbForm({ ...dbForm, host: e.target.value })}
+                  className="col-span-2 rounded border px-3 py-2 text-sm"
+                />
+                <input
+                  required
+                  type="number"
+                  placeholder="Port"
+                  value={dbForm.port}
+                  onChange={(e) => setDbForm({ ...dbForm, port: Number(e.target.value) })}
+                  className="rounded border px-3 py-2 text-sm"
+                />
               </div>
-              <input required placeholder="Target Database Name" value={dbForm.database} onChange={(e) => setDbForm({ ...dbForm, database: e.target.value })} className="w-full rounded border px-3 py-2 text-sm" />
-              <input required placeholder="Username" value={dbForm.username} onChange={(e) => setDbForm({ ...dbForm, username: e.target.value })} className="w-full rounded border px-3 py-2 text-sm" />
-              <input type="password" placeholder="Target DB Password" value={dbForm.password} onChange={(e) => setDbForm({ ...dbForm, password: e.target.value })} className="w-full rounded border px-3 py-2 text-sm" />
+              <input
+                required
+                placeholder="Target Database Name"
+                value={dbForm.database}
+                onChange={(e) => setDbForm({ ...dbForm, database: e.target.value })}
+                className="w-full rounded border px-3 py-2 text-sm"
+              />
+              <input
+                required
+                placeholder="Username"
+                value={dbForm.username}
+                onChange={(e) => setDbForm({ ...dbForm, username: e.target.value })}
+                className="w-full rounded border px-3 py-2 text-sm"
+              />
+              <input
+                type="password"
+                placeholder="Target DB Password"
+                value={dbForm.password}
+                onChange={(e) => setDbForm({ ...dbForm, password: e.target.value })}
+                className="w-full rounded border px-3 py-2 text-sm"
+              />
               <label className="flex items-center gap-2 text-xs">
-                <input type="checkbox" checked={dbForm.ssl} onChange={(e) => setDbForm({ ...dbForm, ssl: e.target.checked })} /> Use SSL
+                <input
+                  type="checkbox"
+                  checked={dbForm.ssl}
+                  onChange={(e) => setDbForm({ ...dbForm, ssl: e.target.checked })}
+                />{' '}
+                Use SSL
               </label>
 
-              <button type="button" onClick={handleTestDb} className="w-full rounded bg-slate-800 py-2 text-xs font-semibold text-white">
+              <button
+                type="button"
+                onClick={handleTestDb}
+                className="w-full rounded bg-slate-800 py-2 text-xs font-semibold text-white"
+              >
                 1. Test Target Connection
               </button>
               {dbTestResult && (
-                <p className={`rounded p-2 text-xs ${dbTestResult.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}`}>
+                <p
+                  className={`rounded p-2 text-xs ${
+                    dbTestResult.ok ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'
+                  }`}
+                >
                   {dbTestResult.ok ? `Connected: ${dbTestResult.version}` : `Error: ${dbTestResult.error}`}
                 </p>
               )}
 
-              <input required type="password" placeholder="Super Admin Re-Auth Password (বাধ্যতামূলক)" value={dbForm.reauthPassword} onChange={(e) => setDbForm({ ...dbForm, reauthPassword: e.target.value })} className="w-full rounded border px-3 py-2 text-sm" />
+              <input
+                required
+                type="password"
+                placeholder="Super Admin Re-Auth Password (বাধ্যতামূলক)"
+                value={dbForm.reauthPassword}
+                onChange={(e) => setDbForm({ ...dbForm, reauthPassword: e.target.value })}
+                className="w-full rounded border px-3 py-2 text-sm"
+              />
               <label className="flex items-center gap-2 text-xs">
-                <input required type="checkbox" checked={dbForm.confirmZeroDataLossAck} onChange={(e) => setDbForm({ ...dbForm, confirmZeroDataLossAck: e.target.checked })} />
+                <input
+                  required
+                  type="checkbox"
+                  checked={dbForm.confirmZeroDataLossAck}
+                  onChange={(e) => setDbForm({ ...dbForm, confirmZeroDataLossAck: e.target.checked })}
+                />
                 Confirm Backup + Write-Freeze + Zero-Data-Loss Cutover
               </label>
               <button type="submit" className="w-full rounded bg-red-600 py-2.5 text-sm font-bold text-white">
@@ -416,7 +596,9 @@ export default function SuperAdminPage() {
               {switchSteps.length > 0 && (
                 <div className="space-y-1 rounded bg-slate-50 p-3 text-xs">
                   {switchSteps.map((st, i) => (
-                    <div key={i}><b>Step {st.step}:</b> {st.name} — [{st.status}] {st.detail}</div>
+                    <div key={i}>
+                      <b>Step {st.step}:</b> {st.name} — [{st.status}] {st.detail}
+                    </div>
                   ))}
                 </div>
               )}
@@ -433,7 +615,15 @@ export default function SuperAdminPage() {
               </button>
             </div>
             <table className="w-full text-left text-xs">
-              <thead><tr className="border-b"><th className="p-2">File</th><th className="p-2">Engine</th><th className="p-2">Rows</th><th className="p-2">SHA-256</th><th className="p-2">Action</th></tr></thead>
+              <thead>
+                <tr className="border-b">
+                  <th className="p-2">File</th>
+                  <th className="p-2">Engine</th>
+                  <th className="p-2">Rows</th>
+                  <th className="p-2">SHA-256</th>
+                  <th className="p-2">Action</th>
+                </tr>
+              </thead>
               <tbody>
                 {data.backups.map((b: any) => (
                   <tr key={b.id} className="border-b">
@@ -442,8 +632,15 @@ export default function SuperAdminPage() {
                     <td className="p-2">{b.totalRows}</td>
                     <td className="p-2 font-mono">{b.sha256Checksum.slice(0, 14)}...</td>
                     <td className="flex gap-2 p-2">
-                      <a href={`/api/v1/super-admin/backups/${b.filename}`} className="rounded bg-slate-800 px-2 py-1 text-white">Download</a>
-                      <button onClick={() => handleRestoreBackup(b.filename)} className="rounded bg-amber-600 px-2 py-1 text-white">Restore</button>
+                      <a href={`/api/v1/super-admin/backups/${b.filename}`} className="rounded bg-slate-800 px-2 py-1 text-white">
+                        Download
+                      </a>
+                      <button
+                        onClick={() => handleRestoreBackup(b.filename)}
+                        className="rounded bg-amber-600 px-2 py-1 text-white"
+                      >
+                        Restore
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -456,13 +653,23 @@ export default function SuperAdminPage() {
           <div className="overflow-auto rounded-xl bg-white p-4 shadow-sm">
             <h2 className="mb-3 font-bold">Immutable Audit Logs ({data.auditLogs.length})</h2>
             <table className="w-full text-left text-xs">
-              <thead><tr className="border-b"><th className="p-2">Time</th><th className="p-2">Action</th><th className="p-2">Target</th><th className="p-2">IP</th><th className="p-2">Metadata</th></tr></thead>
+              <thead>
+                <tr className="border-b">
+                  <th className="p-2">Time</th>
+                  <th className="p-2">Action</th>
+                  <th className="p-2">Target</th>
+                  <th className="p-2">IP</th>
+                  <th className="p-2">Metadata</th>
+                </tr>
+              </thead>
               <tbody>
                 {data.auditLogs.map((l: any) => (
                   <tr key={l.id} className="border-b">
                     <td className="p-2">{new Date(l.created_at).toLocaleString()}</td>
                     <td className="p-2 font-bold">{l.action}</td>
-                    <td className="p-2">{l.target_type} ({l.target_id || '-'})</td>
+                    <td className="p-2">
+                      {l.target_type} ({l.target_id || '-'})
+                    </td>
                     <td className="p-2">{l.ip_address}</td>
                     <td className="p-2 font-mono">{l.metadata_json || '-'}</td>
                   </tr>
