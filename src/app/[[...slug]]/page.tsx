@@ -34,18 +34,31 @@ function getCsrfToken(): string {
   return m ? decodeURIComponent(m[1]) : '';
 }
 
+async function safeJsonFetch(url: string, options?: RequestInit) {
+  const res = await fetch(url, options);
+  const text = await res.text();
+  try {
+    const data = JSON.parse(text);
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return {
+      ok: false,
+      status: res.status,
+      data: { error: `API error (${res.status}). Check if /api/v1/[...path]/route.ts is deployed.` },
+    };
+  }
+}
+
 export default function PlatformOrStorefrontPage() {
   const params = useParams<{ slug?: string[] }>();
   const slugParts = params?.slug || [];
 
-  // Mode: Home ('/'), Store ('/{storeSlug}'), Product ('/{storeSlug}/{productSlug}')
   const storeSlug = slugParts[0];
   const productSlug = slugParts[1];
 
   const [user, setUser] = useState<{ id: string; name: string; email: string; platform_role: string } | null>(null);
   const [stores, setStores] = useState<Array<{ id: string; name: string; slug: string; tagline?: string }>>([]);
 
-  // Quick Auth + One-Click Shop States
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [authName, setAuthName] = useState('');
@@ -54,7 +67,6 @@ export default function PlatformOrStorefrontPage() {
   const [shopName, setShopName] = useState('');
   const [createdShop, setCreatedShop] = useState<{ slug: string; storeUrl: string; adminUrl: string } | null>(null);
 
-  // AI Website Analyzer States
   const [analyzeUrl, setAnalyzeUrl] = useState('');
   const [analyzing, setAnalyzing] = useState(false);
   const [analysisId, setAnalysisId] = useState<string | null>(null);
@@ -62,7 +74,6 @@ export default function PlatformOrStorefrontPage() {
   const [aiQuestion, setAiQuestion] = useState('এই Website-এ কী কী Product আছে এবং দাম কত?');
   const [aiAnswer, setAiAnswer] = useState('');
 
-  // Storefront & Cart States
   const [store, setStore] = useState<StoreData | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
@@ -84,36 +95,29 @@ export default function PlatformOrStorefrontPage() {
   const [msg, setMsg] = useState('');
 
   useEffect(() => {
-    fetch('/api/v1/auth/me')
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.user) {
-          setUser(d.user);
-          setOwnerName(d.user.name);
-        }
-      })
-      .catch(() => {});
+    safeJsonFetch('/api/v1/auth/me').then(({ ok, data }) => {
+      if (ok && data.user) {
+        setUser(data.user);
+        setOwnerName(data.user.name);
+      }
+    });
 
     if (!storeSlug) {
-      fetch('/api/v1/stores/public')
-        .then((r) => r.json())
-        .then((d) => setStores(d.stores || []))
-        .catch(() => {});
+      safeJsonFetch('/api/v1/stores/public').then(({ ok, data }) => {
+        if (ok) setStores(data.stores || []);
+      });
     } else {
       const qs = new URLSearchParams({ slug: storeSlug });
       if (productSlug) qs.set('productSlug', productSlug);
-      fetch(`/api/v1/stores/public?${qs.toString()}`)
-        .then((r) => r.json())
-        .then((d) => {
-          if (d.store) {
-            setStore(d.store);
-            setProducts(d.products || []);
-            setSelectedProduct(d.selectedProduct || null);
-          } else {
-            setMsg(d.error || 'Store not found');
-          }
-        })
-        .catch(() => setMsg('Failed to load store'));
+      safeJsonFetch(`/api/v1/stores/public?${qs.toString()}`).then(({ ok, data }) => {
+        if (ok && data.store) {
+          setStore(data.store);
+          setProducts(data.products || []);
+          setSelectedProduct(data.selectedProduct || null);
+        } else {
+          setMsg(data.error || 'Store not found');
+        }
+      });
     }
   }, [storeSlug, productSlug]);
 
@@ -121,7 +125,7 @@ export default function PlatformOrStorefrontPage() {
     e.preventDefault();
     setMsg('');
     const endpoint = authMode === 'register' ? '/api/v1/auth/register' : '/api/v1/auth/login';
-    const res = await fetch(endpoint, {
+    const { ok, data } = await safeJsonFetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(
@@ -130,8 +134,7 @@ export default function PlatformOrStorefrontPage() {
           : { email: authEmail, password: authPassword }
       ),
     });
-    const data = await res.json();
-    if (!res.ok) return setMsg(data.error || 'Auth failed');
+    if (!ok) return setMsg(data.error || 'Auth failed');
     setUser(data.user);
     setOwnerName(data.user.name);
     setMsg('✅ লগইন সম্পন্ন হয়েছে! এখন এক ক্লিকেই আপনার শপ তৈরি করুন।');
@@ -140,7 +143,7 @@ export default function PlatformOrStorefrontPage() {
   async function handleOneClickShop(e: React.FormEvent) {
     e.preventDefault();
     setMsg('');
-    const res = await fetch('/api/v1/stores/one-click', {
+    const { ok, data } = await safeJsonFetch('/api/v1/stores/one-click', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-csrf-token': getCsrfToken() },
       body: JSON.stringify({
@@ -149,8 +152,7 @@ export default function PlatformOrStorefrontPage() {
         publishImmediately: true,
       }),
     });
-    const data = await res.json();
-    if (!res.ok) return setMsg(data.error || 'Shop creation failed (আগে লগইন করুন)');
+    if (!ok) return setMsg(data.error || 'Shop creation failed');
     setCreatedShop(data);
   }
 
@@ -160,13 +162,12 @@ export default function PlatformOrStorefrontPage() {
     setMsg('');
     setAiAnswer('');
     try {
-      const res = await fetch('/api/v1/ai/analyze', {
+      const { ok, data } = await safeJsonFetch('/api/v1/ai/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-csrf-token': getCsrfToken() },
         body: JSON.stringify({ url: analyzeUrl }),
       });
-      const data = await res.json();
-      if (!res.ok) return setMsg(data.error || 'Analysis failed');
+      if (!ok) return setMsg(data.error || 'Analysis failed');
       setAnalysisId(data.analysisId);
       setAnalysisData(data.analysis);
     } finally {
@@ -176,12 +177,11 @@ export default function PlatformOrStorefrontPage() {
 
   async function handleAiChat(e: React.FormEvent) {
     e.preventDefault();
-    const res = await fetch('/api/v1/ai/chat', {
+    const { data } = await safeJsonFetch('/api/v1/ai/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-csrf-token': getCsrfToken() },
       body: JSON.stringify({ analysisId: analysisId || undefined, question: aiQuestion, language: 'bn' }),
     });
-    const data = await res.json();
     setAiAnswer(data.answer || data.error);
   }
 
@@ -189,7 +189,7 @@ export default function PlatformOrStorefrontPage() {
     e.preventDefault();
     if (!store || cart.length === 0) return;
     setMsg('');
-    const res = await fetch('/api/v1/checkout', {
+    const { ok, data } = await safeJsonFetch('/api/v1/checkout', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -207,8 +207,7 @@ export default function PlatformOrStorefrontPage() {
         items: cart.map((c) => ({ productId: c.product.id, quantity: c.quantity })),
       }),
     });
-    const data = await res.json();
-    if (!res.ok) return setMsg(data.error || 'Checkout failed');
+    if (!ok) return setMsg(data.error || 'Checkout failed');
     setOrderResult(data);
     setCart([]);
   }
@@ -216,12 +215,10 @@ export default function PlatformOrStorefrontPage() {
   async function handleTrackOrder(e: React.FormEvent) {
     e.preventDefault();
     const qs = new URLSearchParams(trackQuery);
-    const res = await fetch(`/api/v1/orders/track?${qs.toString()}`);
-    const data = await res.json();
+    const { data } = await safeJsonFetch(`/api/v1/orders/track?${qs.toString()}`);
     setTrackedOrder(data.order || { error: data.error });
   }
 
-  // ==================== STOREFRONT & PRODUCT VIEW ====================
   if (storeSlug) {
     if (!store) {
       return (
@@ -242,9 +239,7 @@ export default function PlatformOrStorefrontPage() {
       }
     })();
 
-    const filtered = products.filter((p) =>
-      p.name.toLowerCase().includes(searchTerm.toLowerCase())
-    );
+    const filtered = products.filter((p) => p.name.toLowerCase().includes(searchTerm.toLowerCase()));
     const cartTotal = cart.reduce((sum, i) => sum + Number(i.product.price) * i.quantity, 0);
 
     return (
@@ -259,10 +254,7 @@ export default function PlatformOrStorefrontPage() {
             </div>
             <div className="flex items-center gap-3 text-sm">
               <Link href="/" className="rounded bg-white/15 px-3 py-1.5 hover:bg-white/25">
-                প্ল্যাটফর্ম হোম
-              </Link>
-              <Link href="/dashboard" className="rounded bg-white/15 px-3 py-1.5 hover:bg-white/25">
-                Owner Admin
+                হোম
               </Link>
             </div>
           </div>
@@ -289,10 +281,7 @@ export default function PlatformOrStorefrontPage() {
                 <p className="text-sm text-slate-600">
                   স্টক: {selectedProduct.is_digital ? 'ডিজিটাল প্রোডাক্ট (তাৎক্ষণিক ডেলিভারি)' : `${selectedProduct.stock} টি`}
                 </p>
-                <div
-                  className="prose prose-sm text-slate-700"
-                  dangerouslySetInnerHTML={{ __html: selectedProduct.description || '' }}
-                />
+                <div className="prose prose-sm text-slate-700" dangerouslySetInnerHTML={{ __html: selectedProduct.description || '' }} />
                 <button
                   onClick={() => setCart((prev) => [...prev, { product: selectedProduct, quantity: 1 }])}
                   className="w-full rounded-lg bg-indigo-600 py-3 font-semibold text-white hover:bg-indigo-700"
@@ -326,11 +315,7 @@ export default function PlatformOrStorefrontPage() {
                     <div key={p.id} className="flex flex-col justify-between rounded-xl border bg-white p-4 shadow-sm">
                       <div>
                         <Link href={`/${store.slug}/${p.slug}`}>
-                          <img
-                            src={imgs[0] || 'https://placehold.co/300x220?text=Product'}
-                            alt={p.name}
-                            className="mb-3 h-40 w-full rounded-lg object-cover"
-                          />
+                          <img src={imgs[0] || 'https://placehold.co/300x220?text=Product'} alt={p.name} className="mb-3 h-40 w-full rounded-lg object-cover" />
                           <h3 className="font-semibold text-slate-900 hover:text-indigo-600">{p.name}</h3>
                         </Link>
                         <p className="mt-1 text-lg font-bold text-indigo-600">৳ {p.price}</p>
@@ -348,7 +333,6 @@ export default function PlatformOrStorefrontPage() {
             </>
           )}
 
-          {/* CART & CHECKOUT */}
           <section className="grid gap-6 md:grid-cols-2">
             <div className="rounded-xl border bg-white p-5 shadow-sm">
               <h3 className="mb-3 text-lg font-bold">শপিং কার্ট ও চেকআউট ({cart.length})</h3>
@@ -392,14 +376,6 @@ export default function PlatformOrStorefrontPage() {
               {orderResult && (
                 <div className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
                   অর্ডার সফল! Order ID: <b>{orderResult.orderNumber}</b> | Payment Status: <b>{orderResult.paymentStatus}</b>
-                  {orderResult.bkash?.bkashURL && (
-                    <a href={orderResult.bkash.bkashURL} className="mt-2 block text-indigo-700 underline">
-                      bKash পেমেন্ট পেজে যান
-                    </a>
-                  )}
-                  {orderResult.bkash && !orderResult.bkash.configured && (
-                    <p className="mt-1 text-xs text-amber-700">{orderResult.bkash.message}</p>
-                  )}
                 </div>
               )}
             </div>
@@ -413,11 +389,7 @@ export default function PlatformOrStorefrontPage() {
                   স্ট্যাটাস দেখুন
                 </button>
               </form>
-              {trackedOrder && (
-                <pre className="mt-3 overflow-auto rounded bg-slate-100 p-3 text-xs">
-                  {JSON.stringify(trackedOrder, null, 2)}
-                </pre>
-              )}
+              {trackedOrder && <pre className="mt-3 overflow-auto rounded bg-slate-100 p-3 text-xs">{JSON.stringify(trackedOrder, null, 2)}</pre>}
             </div>
           </section>
         </main>
@@ -425,7 +397,6 @@ export default function PlatformOrStorefrontPage() {
     );
   }
 
-  // ==================== PLATFORM HOME: AI ANALYZER + ONE-CLICK SHOP BUILDER ====================
   return (
     <div className="min-h-screen bg-gradient-to-b from-indigo-50 via-white to-slate-50">
       <nav className="border-b bg-white/90 backdrop-blur">
@@ -433,10 +404,7 @@ export default function PlatformOrStorefrontPage() {
           <span className="text-xl font-extrabold text-indigo-700">BongoCommerce SaaS</span>
           <div className="flex flex-wrap items-center gap-2 text-sm">
             <Link href="/dashboard" className="rounded-lg bg-indigo-600 px-3 py-1.5 font-medium text-white">
-              User / Owner Panel
-            </Link>
-            <Link href="/super-admin" className="rounded-lg bg-slate-900 px-3 py-1.5 font-medium text-white">
-              Super Admin
+              আমার শপ / ড্যাশবোর্ড
             </Link>
           </div>
         </div>
@@ -445,12 +413,9 @@ export default function PlatformOrStorefrontPage() {
       <main className="mx-auto max-w-6xl space-y-8 p-4 md:p-8">
         {msg && <div className="rounded-lg border border-indigo-200 bg-indigo-50 p-3 text-sm text-indigo-900">{msg}</div>}
 
-        {/* HERO + ONE-CLICK SHOP CREATION */}
         <section className="grid gap-6 md:grid-cols-2">
           <div className="rounded-2xl border bg-white p-6 shadow-sm">
-            <h1 className="text-2xl font-extrabold text-slate-900">
-              এক ক্লিকেই আপনার নিজস্ব অনলাইন শপ তৈরি করুন
-            </h1>
+            <h1 className="text-2xl font-extrabold text-slate-900">এক ক্লিকেই আপনার নিজস্ব অনলাইন শপ তৈরি করুন</h1>
             <p className="mt-2 text-sm text-slate-600">
               আপনার নিজের কোনো Website নেই? চিন্তা নেই! আপনার নাম দিয়ে এক ক্লিকেই নিজের Online Shop তৈরি করুন।
             </p>
@@ -462,10 +427,10 @@ export default function PlatformOrStorefrontPage() {
                   <button type="button" onClick={() => setAuthMode('login')} className={`rounded px-3 py-1 ${authMode === 'login' ? 'bg-indigo-600 text-white' : 'bg-slate-100'}`}>লগইন</button>
                 </div>
                 {authMode === 'register' && (
-                  <input required placeholder="আপনার নাম (যেমন: Rahim)" value={authName} onChange={(e) => setAuthName(e.target.value)} className="w-full rounded-lg border px-3 py-2 text-sm" />
+                  <input required minLength={2} placeholder="আপনার নাম (যেমন: Rahim)" value={authName} onChange={(e) => setAuthName(e.target.value)} className="w-full rounded-lg border px-3 py-2 text-sm" />
                 )}
                 <input required type="email" placeholder="ইমেইল" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} className="w-full rounded-lg border px-3 py-2 text-sm" />
-                <input required type="password" placeholder="পাসওয়ার্ড (কমপক্ষে ৮ অক্ষর)" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full rounded-lg border px-3 py-2 text-sm" />
+                <input required minLength={8} type="password" placeholder="পাসওয়ার্ড (কমপক্ষে ৮ অক্ষর)" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full rounded-lg border px-3 py-2 text-sm" />
                 <button type="submit" className="w-full rounded-lg bg-slate-900 py-2.5 text-sm font-semibold text-white">
                   {authMode === 'register' ? 'রেজিস্টার করে শুরু করুন' : 'লগইন করুন'}
                 </button>
@@ -496,21 +461,13 @@ export default function PlatformOrStorefrontPage() {
             )}
           </div>
 
-          {/* AI WEBSITE ANALYZER */}
           <div className="rounded-2xl border bg-white p-6 shadow-sm">
             <h2 className="text-xl font-bold text-slate-900">AI Website Link Analyzer</h2>
             <p className="mt-1 text-xs text-slate-600">
               যেকোনো পাবলিক ওয়েবসাইটের লিংক দিন—AI যাচাইকৃত প্রোডাক্ট, দাম ও তথ্য বের করে দেখাবে (SSRF সুরক্ষিত)।
             </p>
             <form onSubmit={handleAnalyzeWebsite} className="mt-4 flex gap-2">
-              <input
-                required
-                type="url"
-                placeholder="https://example.com"
-                value={analyzeUrl}
-                onChange={(e) => setAnalyzeUrl(e.target.value)}
-                className="flex-1 rounded-lg border px-3 py-2 text-sm"
-              />
+              <input required type="url" placeholder="https://example.com" value={analyzeUrl} onChange={(e) => setAnalyzeUrl(e.target.value)} className="flex-1 rounded-lg border px-3 py-2 text-sm" />
               <button disabled={analyzing} type="submit" className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white">
                 {analyzing ? 'বিশ্লেষণ হচ্ছে...' : 'Analyze'}
               </button>
@@ -533,7 +490,6 @@ export default function PlatformOrStorefrontPage() {
           </div>
         </section>
 
-        {/* ACTIVE PUBLIC STORES */}
         <section className="rounded-2xl border bg-white p-6 shadow-sm">
           <h2 className="mb-4 text-lg font-bold">প্ল্যাটফর্মের সক্রিয় শপসমূহ</h2>
           {stores.length === 0 ? (
