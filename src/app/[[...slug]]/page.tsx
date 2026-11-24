@@ -44,7 +44,7 @@ async function safeJsonFetch(url: string, options?: RequestInit) {
     return {
       ok: false,
       status: res.status,
-      data: { error: `API error (${res.status}). Check if /api/v1/[...path]/route.ts is deployed.` },
+      data: { error: `API পাওয়া যায়নি (${res.status})। GitHub-এ src/app/api/v1/[...path]/route.ts আছে কি না দেখুন।` },
     };
   }
 }
