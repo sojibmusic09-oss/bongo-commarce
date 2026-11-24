@@ -55,6 +55,26 @@ import { z } from 'zod';
 
 type RouteContext = { params: Promise<{ path: string[] }> };
 
+interface WaBotBridge {
+  getStatus: (deviceId?: number) => unknown;
+  requestPairingCode: (deviceId: number, phone: string) => Promise<string>;
+  logoutDevice: (deviceId?: number) => Promise<void>;
+  hardReset: (deviceId?: number) => Promise<void>;
+  setApiKeys: (rawKeys: string) => { totalKeys: number };
+  saveConfig: (cfg: { adminPhone?: string; telegramBotToken?: string; telegramChatId?: string }) => unknown;
+  testTelegram: () => Promise<void>;
+  broadcast: (message: string, imageUrl?: string) => Promise<{ totalRecipients: number }>;
+  testChat: (message: string) => Promise<string>;
+}
+
+function getWaBot(): WaBotBridge {
+  const bot = (globalThis as { __bongoWaBot?: WaBotBridge }).__bongoWaBot;
+  if (!bot) {
+    throw new Error('WhatsApp Bot Engine চালু নেই। Render-এ Start Command: node server.js ব্যবহার করুন।');
+  }
+  return bot;
+}
+
 function handleError(err: unknown) {
   if (err instanceof AuthError) {
     return NextResponse.json({ error: err.message }, { status: err.status });
@@ -82,6 +102,13 @@ export async function GET(req: Request, context: RouteContext) {
     if (route === 'auth/me') {
       const user = await getSessionUser();
       return NextResponse.json({ user });
+    }
+
+    if (route === 'whatsapp/status') {
+      await requireAuth();
+      const devId = Number(url.searchParams.get('device') || 1);
+      const bot = getWaBot();
+      return NextResponse.json({ data: bot.getStatus(devId) });
     }
 
     if (route === 'stores/public') {
@@ -283,6 +310,48 @@ async function handleMutation(req: Request, context: RouteContext) {
     if (freezeResp && !route.startsWith('auth/')) return freezeResp;
 
     const body = await req.json().catch(() => ({}));
+
+    // WHATSAPP BOT CONTROLS
+    if (segs[0] === 'whatsapp') {
+      await requireAuth();
+      const bot = getWaBot();
+      if (route === 'whatsapp/pairing-code') {
+        const pairingCode = await bot.requestPairingCode(Number(body.device || 1), String(body.phone || ''));
+        return NextResponse.json({ success: true, pairingCode });
+      }
+      if (route === 'whatsapp/hard-reset') {
+        await bot.hardReset(Number(body.device || 1));
+        return NextResponse.json({ success: true, message: 'ডিভাইস হার্ড রিসেট সম্পন্ন হয়েছে।' });
+      }
+      if (route === 'whatsapp/logout') {
+        await bot.logoutDevice(Number(body.device || 1));
+        return NextResponse.json({ success: true, message: 'ডিভাইস লগআউট সম্পন্ন হয়েছে।' });
+      }
+      if (route === 'whatsapp/api-keys') {
+        const res = bot.setApiKeys(String(body.apiKeys || ''));
+        return NextResponse.json({ success: true, ...res });
+      }
+      if (route === 'whatsapp/config') {
+        const cfg = bot.saveConfig({
+          adminPhone: body.adminPhone,
+          telegramBotToken: body.telegramBotToken,
+          telegramChatId: body.telegramChatId,
+        });
+        return NextResponse.json({ success: true, config: cfg });
+      }
+      if (route === 'whatsapp/test-telegram') {
+        await bot.testTelegram();
+        return NextResponse.json({ success: true, message: 'টেলিগ্রামে টেস্ট মেসেজ পাঠানো হয়েছে!' });
+      }
+      if (route === 'whatsapp/broadcast') {
+        const res = await bot.broadcast(String(body.message || ''), body.imageUrl ? String(body.imageUrl) : undefined);
+        return NextResponse.json({ success: true, ...res });
+      }
+      if (route === 'whatsapp/test-chat') {
+        const reply = await bot.testChat(String(body.message || ''));
+        return NextResponse.json({ success: true, reply });
+      }
+    }
 
     if (route === 'auth/register') {
       if (!checkRateLimit(`reg:${ip}`, 10, 60_000)) {
