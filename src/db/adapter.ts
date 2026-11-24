@@ -22,6 +22,8 @@ export interface DatabaseAdapter extends DbExecutor {
   close(): Promise<void>;
 }
 
+type SqlPrimitive = string | number | boolean | null | Date | Buffer;
+
 const RUNTIME_DB_CONFIG_PATH = path.resolve(
   process.cwd(),
   process.env.LOCAL_STORAGE_PATH || './storage',
@@ -36,10 +38,6 @@ const WRITE_FREEZE_FILE = path.resolve(
   'write-freeze.lock'
 );
 
-/**
- * Safely converts '?' positional parameters to PostgreSQL '$1, $2, ...'
- * while ignoring '?' characters inside single-quoted SQL string literals.
- */
 export function convertPlaceholdersToPg(sql: string): string {
   let index = 0;
   let inSingleQuote = false;
@@ -65,12 +63,21 @@ export function convertPlaceholdersToPg(sql: string): string {
   return result;
 }
 
-function normalizeParams(params: unknown[] = []): unknown[] {
+function normalizeParams(params: unknown[] = []): SqlPrimitive[] {
   return params.map((p) => {
+    if (p === undefined || p === null) return null;
     if (p instanceof Date) {
       return p.toISOString().slice(0, 23).replace('T', ' ');
     }
-    return p === undefined ? null : p;
+    if (
+      typeof p === 'string' ||
+      typeof p === 'number' ||
+      typeof p === 'boolean' ||
+      Buffer.isBuffer(p)
+    ) {
+      return p;
+    }
+    return String(p);
   });
 }
 
@@ -94,7 +101,7 @@ export function createAdapterFromConfig(config: DatabaseConnectionConfig): Datab
       params: unknown[] = []
     ): Promise<DbQueryResult<T>> => {
       const pgSql = convertPlaceholdersToPg(sql);
-      const res = await client.query(pgSql, params);
+      const res = await client.query(pgSql, normalizeParams(params));
       return {
         rows: (res.rows as T[]) || [],
         rowCount: res.rowCount ?? res.rows.length,
@@ -138,7 +145,6 @@ export function createAdapterFromConfig(config: DatabaseConnectionConfig): Datab
     };
   }
 
-  // MySQL or MariaDB
   const pool = mysql.createPool({
     host: config.host,
     port: config.port,
