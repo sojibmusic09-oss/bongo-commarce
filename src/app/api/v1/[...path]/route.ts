@@ -268,9 +268,13 @@ async function handleMutation(req: Request, context: RouteContext) {
     const ip = await getClientIp();
     const db = getDb();
 
-    // Auth login/register/checkout/ai public endpoints skip CSRF check; protected mutations enforce CSRF
-    const isPublicAuth = route === 'auth/login' || route === 'auth/register' || route === 'checkout' || route === 'ai/analyze' || route === 'ai/chat';
-    if (!isPublicAuth && !(await verifyCsrf(req))) {
+    const isPublicEndpoint =
+      route === 'auth/login' ||
+      route === 'auth/register' ||
+      route === 'checkout' ||
+      route === 'ai/analyze' ||
+      route === 'ai/chat';
+    if (!isPublicEndpoint && !(await verifyCsrf(req))) {
       return NextResponse.json({ error: 'Invalid CSRF token' }, { status: 403 });
     }
 
